@@ -1,0 +1,32 @@
+# Virtual Environment
+venv/
+.venv/
+env/
+
+# Python cache & temporary files
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+
+# Sensitive environment variables & secrets (Never commit API keys/passwords)
+.env
+
+# Images, screenshots, and visual run artifacts
+artifacts/
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+batch_summary.txt
+survey_summary.txt
+
+# Scratch experimentation scripts & test dumps
+scratch/
+test_*.py
+test_pages/
+
+# System files
+.DS_Store
+Thumbs.db
