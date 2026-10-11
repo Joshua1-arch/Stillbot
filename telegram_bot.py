@@ -528,6 +528,26 @@ def main():
 
     application.add_handler(conv_handler)
 
+    # Lightweight background HTTP health check server for Render Web Service
+    import threading
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"Stillbot is running and healthy!")
+
+        def log_message(self, format, *args):
+            return  # Suppress health check access logs
+
+    port = int(os.getenv("PORT", 10000))
+    httpd = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    server_thread.start()
+    print(f"🌐 Health server listening on port {port} for Render")
+
     print("🤖 Conversational Telegram Bot is running... Waiting for /start")
     application.run_polling()
 
