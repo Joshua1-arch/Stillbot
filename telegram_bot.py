@@ -383,8 +383,20 @@ async def start_execution(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(emails) > 1:
             instance_instructions += f"\nBATCH ITERATION {idx}: You may vary your Name and Age to appear as a unique respondent, but you MUST strictly maintain the City, State, and ZIP matching the IP above.\n"
             
+        async def send_status(msg: str):
+            try:
+                await update.message.reply_text(msg, parse_mode="Markdown")
+            except Exception:
+                pass
+
         try:
-            res_data = await run_bot(target_url=target_url, instructions=instance_instructions, proxy=bot_proxy_param, run_index=idx)
+            res_data = await run_bot(
+                target_url=target_url,
+                instructions=instance_instructions,
+                proxy=bot_proxy_param,
+                run_index=idx,
+                status_callback=send_status
+            )
             
             # Extract answers, exit reason, and screenshot
             if isinstance(res_data, dict) and "summary" in res_data:

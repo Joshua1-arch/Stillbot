@@ -404,8 +404,13 @@ async def detect_validation_errors(page):
     except Exception:
         return []
 
-async def run_bot(target_url: str = None, instructions: str = None, proxy: str = None, run_index: int = 1):
+async def run_bot(target_url: str = None, instructions: str = None, proxy: str = None, run_index: int = 1, status_callback = None):
     print("🚀 Booting Universal Questionnaire Bot...")
+    if status_callback:
+        try:
+            await status_callback(f"🚀 **Run {run_index} Started!**\n• Initializing stealth browser environment...")
+        except Exception:
+            pass
     
     # Apply runtime overrides if provided per run instance
     active_url = target_url or config.TARGET_URL
@@ -718,12 +723,20 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
                 break
                 
             # 5. Act (Universally Fill Fields)
+            filled_count = 0
             for f in fields:
                 f_id = f["id"]
                 if f_id in answers:
                     await fill_field(page, f, answers[f_id])
                     session_memory[f.get("label", "Unknown")] = answers[f_id]["value"]
+                    filled_count += 1
                     
+            if status_callback:
+                try:
+                    await status_callback(f"⏳ **Page {page_num} Analyzed & Answered**\n• Answered {filled_count} field(s)\n• Advancing to next page...")
+                except Exception:
+                    pass
+
             await page.wait_for_timeout(1000)
             
             # 6. Navigate (Find and Click Next / Continue / Submit)
