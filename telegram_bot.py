@@ -540,6 +540,15 @@ def main():
 
     application.add_handler(conv_handler)
 
+    # Ensure Playwright Chromium browser binary is present on Linux/Render
+    import subprocess
+    try:
+        print("🔍 Checking Playwright browser binaries...")
+        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+        print("✅ Playwright Chromium binary verified.")
+    except Exception as e:
+        print(f"⚠️ Playwright auto-install note: {e}")
+
     # Lightweight background HTTP health check server for Render Web Service
     import threading
     from http.server import HTTPServer, BaseHTTPRequestHandler
