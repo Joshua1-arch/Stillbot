@@ -428,7 +428,12 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
     
     exit_reason = ""
     async with async_playwright() as p:
-        is_headless = os.getenv("HEADLESS", "False").lower() == "true"
+        # On Linux/Render servers without physical display, force headless=True
+        if os.name != "nt":
+            is_headless = True
+        else:
+            is_headless = os.getenv("HEADLESS", "False").lower() == "true"
+
         import tempfile
         import shutil
         temp_user_data_dir = tempfile.mkdtemp(prefix="stillbot_chrome_")
@@ -440,11 +445,12 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-infobars",
+                "--disable-gpu",
                 "--window-size=1280,800"
             ]
         }
         if not is_headless:
-            # Place window offscreen/minimized so it doesn't interrupt the user's active desktop
+            # Place window offscreen/minimized on desktop Windows so it doesn't interrupt the user
             launch_args["args"].extend(["--window-position=2000,2000", "--start-minimized"])
         
         dynamic_bridge = None
