@@ -64,6 +64,7 @@ Politics: Republican/Democrat/Independent (Voting Status: YES).
 Bank: Bank of America (Checking & Savings). Credit Card: AMEX.
 Internet/TV: Satellite / AT&T / Direct TV.
 Shopping: Aldi, Costco, Walmart, Amazon, Target.
+Gift Card / Rewards Preference: ALWAYS choose Amazon Gift Card (Mandatory: Amazon is your required reward choice).
 
 CRITICAL: Act smart and real. Answer dynamically based on survey requirements while defaulting to this profile.
 """

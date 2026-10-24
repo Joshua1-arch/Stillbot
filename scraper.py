@@ -17,29 +17,73 @@ async def scrape_frame(frame: Frame, frame_index: int = 0):
     () => {
         const results = [];
         const radioGroups = {};
-        // Look for standard inputs, contenteditables, and common ARIA roles across all web platforms
-        const selectors = 'input, select, textarea, [contenteditable="true"], [role="textbox"], [role="radio"], [role="checkbox"], [role="listbox"], [role="combobox"]';
+        // Look for standard inputs, contenteditables, common ARIA roles, and signature canvases across all web platforms
+        const selectors = 'input, select, textarea, [contenteditable="true"], [role="textbox"], [role="radio"], [role="checkbox"], [role="listbox"], [role="combobox"], canvas.SignatureCanvas, canvas[id*="Signature" i], .SignatureBox canvas, canvas[class*="signature" i]';
         const elements = document.querySelectorAll(selectors);
         
         elements.forEach((el, index) => {
             // Skip invisible elements and hidden mobile clones (e.g. Confirmit mobile_QFAM controls)
+            // Note: Custom styled radios/checkboxes (REDCap, Modern Qualtrics) often hide native inputs (0x0 or display:none)
+            // but have an associated visible <label for="..."> or parent label.
             const isHidden = (el.offsetWidth === 0 && el.offsetHeight === 0) || window.getComputedStyle(el).display === 'none' || window.getComputedStyle(el).visibility === 'hidden';
-            if (isHidden && !el.closest('label')) return;
+            let hasVisibleLabel = false;
+            if (el.closest('label')) {
+                const pLbl = el.closest('label');
+                if ((pLbl.offsetWidth > 0 || pLbl.offsetHeight > 0) && window.getComputedStyle(pLbl).display !== 'none') {
+                    hasVisibleLabel = true;
+                }
+            }
+            if (!hasVisibleLabel && el.id) {
+                try {
+                    const labels = document.querySelectorAll(`label[for="${CSS.escape(el.id)}"]`);
+                    for (const l of labels) {
+                        if ((l.offsetWidth > 0 || l.offsetHeight > 0) && window.getComputedStyle(l).display !== 'none') {
+                            hasVisibleLabel = true;
+                            break;
+                        }
+                    }
+                } catch(e) {}
+            }
+            const isRadioOrCheck = el.type === 'radio' || el.type === 'checkbox' || el.getAttribute('role') === 'radio' || el.getAttribute('role') === 'checkbox';
+            if (isRadioOrCheck && !hasVisibleLabel) {
+                const parentContainer = el.closest('td, th, [role="gridcell"], .ControlContainer, .q-radio, .choice, .Selection, .QuestionBody, .ChoiceStructure, tr, li, div[class*="radio" i], div[class*="checkbox" i]');
+                if (parentContainer && (parentContainer.offsetWidth > 0 || parentContainer.offsetHeight > 0) && window.getComputedStyle(parentContainer).display !== 'none' && window.getComputedStyle(parentContainer).visibility !== 'hidden') {
+                    hasVisibleLabel = true;
+                }
+            }
+            if (isHidden && !hasVisibleLabel) return;
             if (el.id && el.id.toLowerCase().startsWith('mobile_')) return;
             if (el.type === 'hidden' || el.type === 'submit' || el.type === 'button' || el.type === 'reset') return;
+            if (el.classList.contains('hiddenradio')) return;
             
             // Skip security tokens, CSRF, and anti-bot verification inputs (e.g. Verisoul, Recaptcha, Turnstile)
             const elId = (el.id || '').toLowerCase();
             const elName = (el.name || '').toLowerCase();
-            const secTokens = ['sessionid', 'verisoul', 'recaptcha', 'hcaptcha', 'turnstile', 'csrf', '_token', '__viewstate', 'fingerprint'];
+            const secTokens = ['sessionid', 'verisoul', 'recaptcha', 'hcaptcha', 'turnstile', 'csrf', '_token', '__viewstate', 'fingerprint', 'bot_check', 'honeypot'];
             if (secTokens.some(k => elId.includes(k) || elName.includes(k))) return;
             
             // 1. Accessible Name Extraction
             let name = el.getAttribute('aria-label') || '';
             
+            // For radio and checkbox inputs, prioritize the specific option label (e.g. "Yes", "No", "Male")
+            if ((el.type === 'radio' || el.type === 'checkbox') && el.id) {
+                try {
+                    const labels = document.querySelectorAll(`label[for="${CSS.escape(el.id)}"]`);
+                    for (const l of labels) {
+                        const txt = (l.innerText || '').trim();
+                        if (txt) { name = txt; break; }
+                    }
+                } catch(e) {}
+            }
+            if (!name && (el.type === 'radio' || el.type === 'checkbox') && el.closest('label')) {
+                name = el.closest('label').innerText.trim();
+            }
+
             if (!name && el.getAttribute('aria-labelledby')) {
                 const idList = el.getAttribute('aria-labelledby').split(/\s+/);
-                const parts = idList.map(i => {
+                // If multiple IDs on a radio/checkbox, the last one is typically the option-specific label
+                const targetIds = (el.type === 'radio' || el.type === 'checkbox') && idList.length > 1 ? [idList[idList.length - 1]] : idList;
+                const parts = targetIds.map(i => {
                     const found = document.getElementById(i);
                     return found ? found.innerText.trim() : '';
                 }).filter(Boolean);
@@ -48,8 +92,11 @@ async def scrape_frame(frame: Frame, frame_index: int = 0):
             
             if (!name && el.id) {
                 try {
-                    const labelEl = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
-                    if (labelEl) name = labelEl.innerText;
+                    const labels = document.querySelectorAll(`label[for="${CSS.escape(el.id)}"]`);
+                    for (const l of labels) {
+                        const txt = (l.innerText || '').trim();
+                        if (txt) { name = txt; break; }
+                    }
                 } catch(e) {
                     try {
                         const labelEl = document.querySelector(`label[for="${el.id}"]`);
@@ -95,31 +142,50 @@ async def scrape_frame(frame: Frame, frame_index: int = 0):
             
             // 2. Advanced Universal Context / Question Title Extraction
             let contextHeading = "";
-            let container = el.closest('fieldset, .cf-question, .question, .question-container, .form-group, [role="radiogroup"], [role="group"], .geS5n, [jsmodel], form > div, .QuestionOuter, .survey-question, div[data-testid*="question"], .freebirdFormviewerViewItemsItemItem, .form-line');
-            if (!container) {
-                container = el.closest('div[class*="question" i]:not([class*="answer" i]):not([class*="choice" i])');
-            }
-            if (container && (container.className || '').includes('answer')) {
-                container = container.closest('.cf-question, .question, fieldset') || container;
-            }
-            if (container) {
-                let headingEl = container.querySelector('legend, h1, h2, h3, h4, h5, h6, [role="heading"], .title, .question-title, .question-title-container, .QuestionText, .exportItemTitle, [data-testid*="title"], [data-testid*="header"], .cf-question__text, .cf-question__title, [class*="question-text" i], [class*="question__text" i]');
-                if (headingEl) {
-                    contextHeading = headingEl.innerText.trim();
-                } else {
-                    let firstLine = container.innerText.split('\n')[0].trim();
-                    if (firstLine.length > 3 && firstLine.length < 150) contextHeading = firstLine;
+            let container = el.closest('.cf-question, .question, .question-container, tr[id*="-tr"], tr[sq_id], fieldset, [role="radiogroup"], [role="group"], .geS5n, .QuestionOuter, .survey-question, div[data-testid*="question"], .freebirdFormviewerViewItemsItemItem, .form-line, .form-group, div[class*="question" i]:not([class*="answer" i]):not([class*="choice" i])');
+            let searchEl = container || el;
+            while (searchEl && searchEl !== document.body && !contextHeading) {
+                const containerCandidate = searchEl.closest('.cf-question, .question, .question-container, tr[id*="-tr"], tr[sq_id], fieldset, [role="radiogroup"], [role="group"], .geS5n, .QuestionOuter, .survey-question, div[data-testid*="question"], .freebirdFormviewerViewItemsItemItem, .form-line, .form-group, div[class*="question" i]:not([class*="answer" i]):not([class*="choice" i])');
+                if (!containerCandidate) break;
+                
+                // If containerCandidate is fieldset, check its legend first
+                if (containerCandidate.tagName.toLowerCase() === 'fieldset') {
+                    const leg = containerCandidate.querySelector('legend');
+                    if (leg && leg.innerText.trim()) {
+                        contextHeading = leg.innerText.trim();
+                        break;
+                    }
                 }
+                
+                let headingEl = containerCandidate.querySelector('[data-kind="field-label"], .label-fl, td.labelrc:not(.questionnum), .QuestionText, .title, .question-title, .question-title-container, .exportItemTitle, [data-testid*="title"], [data-testid*="header"], .cf-question__text, .cf-question__title, [class*="question-text" i], [class*="question__text" i], legend, [role="heading"]:not(h1)');
+                if (headingEl && headingEl.innerText.trim()) {
+                    contextHeading = headingEl.innerText.trim();
+                    break;
+                }
+                
+                // If no heading element, check first line if this container looks like a specific question block
+                if (!containerCandidate.getAttribute('role')?.includes('group') && containerCandidate.tagName.toLowerCase() !== 'div') {
+                    let firstLine = containerCandidate.innerText.split('\n')[0].trim();
+                    if (firstLine.length > 3 && firstLine.length < 150 && !firstLine.toLowerCase().includes('change survey language')) {
+                        contextHeading = firstLine;
+                        break;
+                    }
+                }
+                
+                searchEl = containerCandidate.parentElement;
             }
             if (!contextHeading) {
-                const globalHeading = document.querySelector('.cf-question__text, .cf-question__title, [class*="question__text" i], [class*="question-text" i], .QuestionText, h1, h2, h3');
-                if (globalHeading) contextHeading = globalHeading.innerText.trim();
+                const singlePageHeading = document.querySelector('.cf-question__text, .cf-question__title, [class*="question__text" i], [class*="question-text" i], .QuestionText');
+                if (singlePageHeading) contextHeading = singlePageHeading.innerText.trim();
             }
             
             // 3. Determine Role
             let role = el.getAttribute('role');
             if (!role) {
-                if (tag === 'input') {
+                if (tag === 'canvas' || el.classList.contains('SignatureCanvas') || (el.id && el.id.toLowerCase().includes('signature'))) {
+                    role = 'signature';
+                    if (!name) name = contextHeading || 'Sign Here';
+                } else if (tag === 'input') {
                     role = el.type === 'checkbox' ? 'checkbox' : (el.type === 'radio' ? 'radio' : 'textbox');
                 } else if (tag === 'select') {
                     role = 'combobox';
@@ -139,7 +205,25 @@ async def scrape_frame(frame: Frame, frame_index: int = 0):
                 let rowLabel = "";
                 let colLabel = "";
                 
-                if (tr && table) {
+                // 1. Google Forms Grid Matrix Detection
+                const rg = el.closest('[role="radiogroup"]');
+                const ariaLbl = el.getAttribute('aria-label') || '';
+                let isGoogleFormsGrid = false;
+                if (ariaLbl.includes(', response for ') || ariaLbl.includes(', response to ')) {
+                    isGoogleFormsGrid = true;
+                    const sep = ariaLbl.includes(', response for ') ? ', response for ' : ', response to ';
+                    const parts = ariaLbl.split(sep);
+                    colLabel = parts[0].trim();
+                    if (parts.length > 1 && parts[1].trim()) {
+                        rowLabel = parts[1].trim();
+                    }
+                }
+                if (!rowLabel && rg && rg.getAttribute('aria-label')) {
+                    rowLabel = rg.getAttribute('aria-label').trim();
+                    if (rowLabel) isGoogleFormsGrid = true;
+                }
+
+                if (tr && table && !isGoogleFormsGrid) {
                     const rowLabelEl = tr.querySelector('.cf-grid-row__label, .cf-label, th, td:first-child');
                     if (rowLabelEl && rowLabelEl !== el.closest('td')) {
                         rowLabel = rowLabelEl.innerText.trim();
@@ -155,9 +239,26 @@ async def scrape_frame(frame: Frame, frame_index: int = 0):
                     }
                 }
 
-                const groupKey = el.name ? ('name_' + el.name) : (tr ? ('row_' + (tr.id || Array.from(document.querySelectorAll('*')).indexOf(tr))) : (container ? ('cont_' + (container.id || Array.from(document.querySelectorAll('*')).indexOf(container))) : ('single_' + index)));
+                let groupKey = "";
+                if (rg) {
+                    groupKey = 'rg_' + (rg.id || Array.from(document.querySelectorAll('[role="radiogroup"]')).indexOf(rg));
+                } else if (el.name) {
+                    groupKey = 'name_' + el.name;
+                } else if (container) {
+                    groupKey = 'cont_' + (container.id || Array.from(document.querySelectorAll('*')).indexOf(container));
+                } else if (tr) {
+                    groupKey = 'row_' + (tr.id || Array.from(document.querySelectorAll('*')).indexOf(tr));
+                } else {
+                    groupKey = 'single_' + index;
+                }
+
                 const optText = colLabel || rawOptionName || el.value || `Option ${index}`;
-                const qLabel = rowLabel ? (contextHeading ? `${contextHeading} - ${rowLabel}` : rowLabel) : (contextHeading || rawOptionName || 'Select an option');
+                let qLabel = contextHeading;
+                if (rowLabel) {
+                    qLabel = contextHeading ? `${contextHeading} - ${rowLabel}` : rowLabel;
+                } else if (!qLabel) {
+                    qLabel = rawOptionName || 'Select an option';
+                }
                 
                 if (!radioGroups[groupKey]) {
                     radioGroups[groupKey] = {
@@ -199,6 +300,8 @@ async def scrape_frame(frame: Frame, frame_index: int = 0):
             
             results.push({
                 id: injectedId,
+                real_id: el.id || '',
+                name: el.name || '',
                 role: role || 'textbox',
                 label: name || `Unknown Field ${index}`,
                 type: el.type || (tag === 'select' ? 'select' : 'text'),
