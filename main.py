@@ -1298,7 +1298,12 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
     
     exit_reason = ""
     async with async_playwright() as p:
-        is_headless = os.getenv("HEADLESS", "False").lower() == "true"
+        # On Linux/Render servers without physical display, force headless=True
+        if os.name != "nt":
+            is_headless = True
+        else:
+            is_headless = os.getenv("HEADLESS", "False").lower() == "true"
+
         import tempfile
         import shutil
         temp_user_data_dir = tempfile.mkdtemp(prefix="stillbot_chrome_")
@@ -1310,6 +1315,7 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-infobars",
+                "--disable-gpu",
                 "--webrtc-ip-handling-policy=disable_non_proxied_udp",
                 "--force-webrtc-ip-handling-policy",
                 "--window-size=1280,800"
@@ -1364,7 +1370,7 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
 
         ctx_kwargs = {
             "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-            "viewport": {"width": 1366, "height": 768},
+            "viewport": {"width": 1280, "height": 800},
             "locale": "en-US",
         }
         if active_timezone:
@@ -1373,18 +1379,30 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
             ctx_kwargs["geolocation"] = geolocation
             ctx_kwargs["permissions"] = ["geolocation"]
 
+        # Determine whether to use Google Chrome channel or bundled Chromium
+        chrome_channel = "chrome" if os.name == "nt" else None
+
         try:
+            kwargs = dict(launch_args)
+            if chrome_channel:
+                kwargs["channel"] = chrome_channel
             browser = await p.chromium.launch_persistent_context(
                 user_data_dir=temp_user_data_dir,
-                channel="chrome",
                 **ctx_kwargs,
-                **launch_args
+                **kwargs
             )
-            print("🌐 Launched Real Google Chrome with human hardware profile & fresh isolated session.")
+            print("🌐 Launched Chromium with human hardware profile & fresh isolated session.")
         except Exception as e:
-            print(f"ℹ️ Google Chrome persistent launch fallback ({e}). Using standard launch.")
-            browser = await p.chromium.launch(channel="chrome", **launch_args)
-            browser = await browser.new_context(**ctx_kwargs)
+            print(f"ℹ️ Persistent launch fallback ({e}). Using standard launch.")
+            try:
+                kwargs_fallback = dict(launch_args)
+                if chrome_channel:
+                    kwargs_fallback["channel"] = chrome_channel
+                b_instance = await p.chromium.launch(**kwargs_fallback)
+                browser = await b_instance.new_context(**ctx_kwargs)
+            except Exception as e2:
+                print(f"❌ Chromium launch error: {e2}")
+                raise
         
         context = browser
         await context.add_init_script("""

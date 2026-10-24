@@ -757,6 +757,35 @@ def main():
 
     application.add_handler(conv_handler)
 
+    # Ensure Playwright Chromium browser binary is present on Linux/Render
+    import subprocess
+    try:
+        print("🔍 Checking Playwright browser binaries...")
+        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+        print("✅ Playwright Chromium binary verified.")
+    except Exception as e:
+        print(f"⚠️ Playwright auto-install note: {e}")
+
+    # Lightweight background HTTP health check server for Render Web Service
+    import threading
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"Stillbot is running and healthy!")
+
+        def log_message(self, format, *args):
+            return  # Suppress health check access logs
+
+    port = int(os.getenv("PORT", 10000))
+    httpd = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    server_thread.start()
+    print(f"🌐 Health server listening on port {port} for Render")
+
     print("🤖 Conversational Telegram Bot is running... Waiting for /start")
     application.run_polling()
 
