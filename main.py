@@ -1002,7 +1002,7 @@ async def fill_field(page, field, answer):
     except Exception as e:
         print(f"❌ Failed to fill field '{name}': {e}")
 
-async def wait_for_human_copilot(page, page_num: int, reason: str = "", status_callback = None, timeout_seconds: int = 300) -> bool:
+async def wait_for_human_copilot(page, page_num: int, reason: str = "", status_callback = None, timeout_seconds: int = 300, chat_id = None) -> bool:
     """
     Co-Pilot Mode (Human-in-the-Loop):
     Pauses autonomous automation without closing the browser and without burning any AI credits.
@@ -1011,12 +1011,14 @@ async def wait_for_human_copilot(page, page_num: int, reason: str = "", status_c
     """
     from run_mode import get_intervention_provider
     provider = get_intervention_provider()
+    resolved_chat = chat_id or getattr(page, "_chat_id", None)
     return await provider.request_intervention(
         page=page,
         page_num=page_num,
         reason=reason,
         status_callback=status_callback,
-        timeout_seconds=timeout_seconds
+        timeout_seconds=timeout_seconds,
+        chat_id=resolved_chat
     )
 
 async def find_advance_button(page):
@@ -1750,7 +1752,7 @@ async def sync_live_dom_to_session_memory(page, session_memory: dict):
     except Exception as e:
         pass
 
-async def run_bot(target_url: str = None, instructions: str = None, proxy: str = None, run_index: int = 1, status_callback = None, user_email: str = None, timezone: str = None, geolocation: dict = None):
+async def run_bot(target_url: str = None, instructions: str = None, proxy: str = None, run_index: int = 1, status_callback = None, user_email: str = None, timezone: str = None, geolocation: dict = None, chat_id: Any = None):
     print("🚀 Booting Universal Questionnaire Bot...")
     if status_callback:
         try:
@@ -1923,6 +1925,17 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
             stealth_async = None
             
         page = context.pages[0] if context.pages else await context.new_page()
+        page._chat_id = chat_id
+        from run_mode import RemoteSessionManager
+        chat_key = str(chat_id or "default")
+        session_id = f"session_{chat_key}_{run_index}"
+        RemoteSessionManager.register_session(
+            session_id=session_id,
+            page=page,
+            chat_id=chat_key,
+            page_num=1,
+            state="RUNNING"
+        )
         if stealth_async:
             await stealth_async(page)
             print("🥷 Playwright Stealth activated.")
@@ -2851,6 +2864,11 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
         except Exception:
             pass
             
+        try:
+            from run_mode import RemoteSessionManager
+            RemoteSessionManager.unregister_session(session_id=session_id, chat_id=chat_key, reason="SURVEY_FINISHED")
+        except Exception:
+            pass
         await browser.close()
         if dynamic_bridge:
             await dynamic_bridge.stop()

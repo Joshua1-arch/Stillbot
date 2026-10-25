@@ -24,7 +24,8 @@ import time
 import asyncio
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Optional, Callable, Awaitable, Dict, Any, Tuple
+from dataclasses import dataclass
+from typing import Optional, Callable, Awaitable, Dict, Any, Tuple, Union
 from playwright.async_api import Page
 
 
@@ -39,6 +40,55 @@ def _safe_print(msg: str) -> None:
             print(clean_msg)
         except Exception:
             pass
+
+
+def log_copilot_event(
+    event: str,
+    chat_id: Optional[Union[str, int]] = None,
+    user_id: Optional[Union[str, int]] = None,
+    session_id: Optional[str] = None,
+    command: Optional[str] = None,
+    action: Optional[str] = None,
+    result: Optional[str] = None,
+    state: Optional[str] = None,
+    page_num: Optional[int] = None,
+    url: Optional[str] = None,
+    details: Optional[Dict[str, Any]] = None,
+    error: Optional[str] = None
+) -> None:
+    """
+    Structured Co-Pilot audit logging.
+    Strictly avoids logging passwords, tokens, API keys, or sensitive respondent answers.
+    """
+    parts = [f"[COPILOT_AUDIT] event={event}"]
+    if chat_id is not None:
+        parts.append(f"chat_id={chat_id}")
+    if user_id is not None:
+        parts.append(f"user_id={user_id}")
+    if session_id:
+        parts.append(f"session_id={session_id}")
+    if command:
+        parts.append(f"cmd={command}")
+    if action:
+        parts.append(f"action={action}")
+    if state:
+        parts.append(f"state={state}")
+    if page_num is not None:
+        parts.append(f"page={page_num}")
+    if result:
+        parts.append(f"result={result}")
+    if url:
+        clean_url = url.split("?")[0] if "?" in url else url
+        parts.append(f"url={clean_url}")
+    if details:
+        safe_details = {
+            k: v for k, v in details.items()
+            if not any(s in k.lower() for s in ["key", "token", "pass", "secret", "auth", "credential"])
+        }
+        parts.append(f"details={safe_details}")
+    if error:
+        parts.append(f"error={error}")
+    _safe_print(" ".join(parts))
 
 
 class RunMode(str, Enum):
@@ -132,82 +182,542 @@ def validate_and_log_run_mode(env: Optional[Dict[str, str]] = None) -> Dict[str,
 # SECURE REMOTE SESSION MANAGER (Cloud Mode)
 # ==============================================================================
 
+@dataclass
+class RemoteSessionInfo:
+    """Represents an active or paused remote browser session."""
+    session_id: str
+    chat_id: str
+    page: Page
+    created_at: float
+    last_active: float
+    user_id: Optional[str] = None
+    page_num: int = 1
+    state: str = "RUNNING"  # "RUNNING", "PAUSED_CO_PILOT", "COMPLETED", "TERMINATED"
+    url: str = ""
+
+
 class RemoteSessionManager:
     """
     Manages active cloud browser sessions and handles remote interaction
     commands dispatched from Telegram or secure API callbacks.
     """
+    _sessions_by_chat: Dict[str, RemoteSessionInfo] = {}
+    _sessions_by_id: Dict[str, RemoteSessionInfo] = {}
     _active_pages: Dict[str, Page] = {}
     _action_queues: Dict[str, asyncio.Queue] = {}
 
     @classmethod
-    def register_session(cls, session_id: str, page: Page) -> None:
+    def register_session(
+        cls,
+        session_id: str,
+        page: Page,
+        chat_id: Optional[Union[str, int]] = None,
+        user_id: Optional[Union[str, int]] = None,
+        page_num: int = 1,
+        state: str = "RUNNING"
+    ) -> RemoteSessionInfo:
+        """Registers an active browser session under its session_id and chat_id."""
+        chat_key = str(chat_id) if chat_id is not None else "default"
+        cur_url = ""
+        try:
+            if not page.is_closed():
+                cur_url = page.url
+        except Exception:
+            pass
+
+        now = time.time()
+        info = RemoteSessionInfo(
+            session_id=session_id,
+            chat_id=chat_key,
+            user_id=str(user_id) if user_id else None,
+            page=page,
+            created_at=now,
+            last_active=now,
+            page_num=page_num,
+            state=state,
+            url=cur_url
+        )
+
+        cls._sessions_by_id[session_id] = info
+        cls._sessions_by_chat[chat_key] = info
         cls._active_pages[session_id] = page
         if session_id not in cls._action_queues:
             cls._action_queues[session_id] = asyncio.Queue()
 
-    @classmethod
-    def unregister_session(cls, session_id: str) -> None:
-        cls._active_pages.pop(session_id, None)
-        cls._action_queues.pop(session_id, None)
+        log_copilot_event(
+            "SESSION_REGISTERED",
+            chat_id=chat_key,
+            user_id=user_id,
+            session_id=session_id,
+            state=state,
+            page_num=page_num,
+            url=cur_url
+        )
+        return info
 
     @classmethod
-    def get_session_page(cls, session_id: str = "default") -> Optional[Page]:
-        if session_id in cls._active_pages:
-            return cls._active_pages[session_id]
-        if cls._active_pages:
-            return next(iter(cls._active_pages.values()))
+    def mark_session_paused(
+        cls,
+        chat_id: Optional[Union[str, int]] = None,
+        session_id: Optional[str] = None,
+        page_num: int = 1,
+        reason: str = ""
+    ) -> Optional[RemoteSessionInfo]:
+        """Marks the session as paused for Co-Pilot human intervention."""
+        info = cls.get_session_info(chat_id=chat_id, session_id=session_id)
+        if info:
+            info.state = "PAUSED_CO_PILOT"
+            info.page_num = page_num
+            info.last_active = time.time()
+            try:
+                if not info.page.is_closed():
+                    info.url = info.page.url
+            except Exception:
+                pass
+            log_copilot_event(
+                "SESSION_PAUSED",
+                chat_id=info.chat_id,
+                session_id=info.session_id,
+                state=info.state,
+                page_num=page_num,
+                url=info.url,
+                details={"reason": reason}
+            )
+        return info
+
+    @classmethod
+    def mark_session_resumed(
+        cls,
+        chat_id: Optional[Union[str, int]] = None,
+        session_id: Optional[str] = None,
+        page_num: int = 1
+    ) -> Optional[RemoteSessionInfo]:
+        """Marks the session as resumed back into automated execution."""
+        info = cls.get_session_info(chat_id=chat_id, session_id=session_id)
+        if info:
+            info.state = "RUNNING"
+            info.page_num = page_num
+            info.last_active = time.time()
+            try:
+                if not info.page.is_closed():
+                    info.url = info.page.url
+            except Exception:
+                pass
+            log_copilot_event(
+                "SESSION_RESUMED",
+                chat_id=info.chat_id,
+                session_id=info.session_id,
+                state=info.state,
+                page_num=page_num,
+                url=info.url
+            )
+        return info
+
+    @classmethod
+    def unregister_session(
+        cls,
+        session_id: Optional[str] = None,
+        chat_id: Optional[Union[str, int]] = None,
+        reason: str = "SURVEY_ENDED"
+    ) -> None:
+        """Removes an active session from the registry upon termination."""
+        chat_key = str(chat_id) if chat_id is not None else None
+        target_info = None
+
+        if session_id and session_id in cls._sessions_by_id:
+            target_info = cls._sessions_by_id.pop(session_id, None)
+            if target_info and target_info.chat_id in cls._sessions_by_chat:
+                cls._sessions_by_chat.pop(target_info.chat_id, None)
+            cls._active_pages.pop(session_id, None)
+            cls._action_queues.pop(session_id, None)
+        elif chat_key and chat_key in cls._sessions_by_chat:
+            target_info = cls._sessions_by_chat.pop(chat_key, None)
+            if target_info:
+                cls._sessions_by_id.pop(target_info.session_id, None)
+                cls._active_pages.pop(target_info.session_id, None)
+                cls._action_queues.pop(target_info.session_id, None)
+
+        if target_info:
+            target_info.state = "TERMINATED"
+            log_copilot_event(
+                "SESSION_CLEANED_UP",
+                chat_id=target_info.chat_id,
+                session_id=target_info.session_id,
+                state="TERMINATED",
+                details={"reason": reason}
+            )
+
+    @classmethod
+    def get_session_info(
+        cls,
+        chat_id: Optional[Union[str, int]] = None,
+        session_id: Optional[str] = None,
+        allow_closed: bool = False
+    ) -> Optional[RemoteSessionInfo]:
+        """Retrieves active session info by chat_id or session_id with health check."""
+        chat_key = str(chat_id) if chat_id is not None else None
+
+        # 1. Lookup by explicit session_id
+        if session_id and session_id in cls._sessions_by_id:
+            info = cls._sessions_by_id[session_id]
+            if allow_closed or not info.page.is_closed():
+                return info
+            cls.unregister_session(session_id=session_id, reason="BROWSER_CLOSED")
+            return None
+
+        # 2. Lookup by explicit chat_id
+        if chat_key and chat_key in cls._sessions_by_chat:
+            info = cls._sessions_by_chat[chat_key]
+            if allow_closed or not info.page.is_closed():
+                return info
+            cls.unregister_session(chat_id=chat_key, reason="BROWSER_CLOSED")
+            return None
+
+        # 3. Fallback: single active session fallback for test suites or default lookup
+        if (chat_key is None or chat_key == "default") and len(cls._sessions_by_chat) == 1:
+            info = next(iter(cls._sessions_by_chat.values()))
+            if allow_closed or not info.page.is_closed():
+                return info
+            cls.unregister_session(chat_id=info.chat_id, reason="BROWSER_CLOSED")
+            return None
+
+        # 4. Check active pages dictionary fallback
+        if session_id and session_id in cls._active_pages:
+            p = cls._active_pages[session_id]
+            if allow_closed or not p.is_closed():
+                return RemoteSessionInfo(
+                    session_id=session_id,
+                    chat_id="default",
+                    page=p,
+                    created_at=time.time(),
+                    last_active=time.time(),
+                    state="RUNNING"
+                )
+
         return None
 
     @classmethod
-    async def dispatch_remote_action(cls, action_type: str, payload: Optional[Dict[str, Any]] = None, session_id: str = "default") -> Dict[str, Any]:
-        """
-        Dispatches and executes a remote action on the active browser session.
-        Supported actions: 'advance', 'click', 'fill', 'dismiss', 'snapshot'.
-        """
-        page = cls.get_session_page(session_id)
-        if not page or page.is_closed():
-            return {"success": False, "error": "No active remote browser session found."}
+    def get_session_page(cls, session_id: str = "default", chat_id: Optional[Union[str, int]] = None) -> Optional[Page]:
+        """Convenience method returning the active Page object for the session."""
+        info = cls.get_session_info(chat_id=chat_id, session_id=session_id)
+        return info.page if info else None
 
+    @classmethod
+    async def dispatch_remote_action(
+        cls,
+        action_type: str,
+        payload: Optional[Dict[str, Any]] = None,
+        session_id: str = "default",
+        chat_id: Optional[Union[str, int]] = None,
+        user_id: Optional[Union[str, int]] = None
+    ) -> Dict[str, Any]:
+        """
+        Dispatches and executes a remote action on the active cloud browser session.
+        Supported actions: 'advance', 'fill', 'click', 'dismiss', 'snapshot'.
+        Verifies post-action state and returns clear diagnostic responses.
+        """
         payload = payload or {}
+        info = cls.get_session_info(chat_id=chat_id, session_id=session_id, allow_closed=True)
+
+        if not info:
+            log_copilot_event(
+                "SESSION_LOOKUP_MISSING",
+                chat_id=chat_id,
+                user_id=user_id,
+                action=action_type,
+                result="NOT_FOUND"
+            )
+            return {
+                "success": False,
+                "error": "No active remote browser session found for your chat. Start a survey with /start or check if the session already completed."
+            }
+
+        page = info.page
+        if page.is_closed():
+            cls.unregister_session(chat_id=info.chat_id, reason="BROWSER_CLOSED")
+            log_copilot_event(
+                "BROWSER_CLOSED",
+                chat_id=info.chat_id,
+                user_id=user_id,
+                session_id=info.session_id,
+                action=action_type
+            )
+            return {
+                "success": False,
+                "error": "The survey browser session was closed or expired. Please start a new survey with /start."
+            }
+
+        log_copilot_event(
+            "ACTION_ATTEMPTED",
+            chat_id=info.chat_id,
+            user_id=user_id,
+            session_id=info.session_id,
+            action=action_type,
+            page_num=info.page_num,
+            url=page.url
+        )
+
         try:
-            if action_type in ["advance", "next", "continue", "submit"]:
-                # Attempt to find and click any standard survey advance button
+            if action_type in ["snapshot", "snap"]:
+                shot = await page.screenshot(type="png")
+                cur_url = page.url
+                try:
+                    title = await page.title()
+                except Exception:
+                    title = "Survey Page"
+                info.last_active = time.time()
+                info.url = cur_url
+                log_copilot_event(
+                    "ACTION_RESULT",
+                    chat_id=info.chat_id,
+                    user_id=user_id,
+                    session_id=info.session_id,
+                    action="snapshot",
+                    result="SUCCESS",
+                    url=cur_url,
+                    page_num=info.page_num
+                )
+                return {
+                    "success": True,
+                    "action": "snapshot",
+                    "screenshot": shot,
+                    "url": cur_url,
+                    "title": title,
+                    "page_num": info.page_num
+                }
+
+            elif action_type in ["advance", "next", "continue", "submit"]:
+                initial_url = page.url
+                initial_content = ""
+                try:
+                    initial_content = await page.evaluate("document.body ? document.body.innerText.slice(0, 300) : ''")
+                except Exception:
+                    pass
+
                 selectors = [
                     '#NextButton', 'button#NextButton', 'input#NextButton',
-                    '.next-button', '.NextButton', 'button.NextButton',
-                    '.cf-navigation-next', 'button.cf-navigation-next',
+                    'button.NextButton', 'input.NextButton', '.NextButton', '.next-button',
+                    '.cf-navigation-next', 'button.cf-navigation-next', '.cf-navigation__button',
                     'button[type="submit"]', 'input[type="submit"]',
-                    'button:has-text("Next")', 'button:has-text("Continue")', 'button:has-text("Submit")'
+                    'button:has-text("Next")', 'button:has-text("Continue")', 'button:has-text("Submit")',
+                    'button:has-text("Proceed")', 'button:has-text("Start")',
+                    '[data-action*="next" i]', '[data-action*="submit" i]'
                 ]
                 clicked = False
+                clicked_selector = None
                 for sel in selectors:
                     loc = page.locator(sel).first
                     if await loc.count() > 0:
                         try:
-                            await loc.scroll_into_view_if_needed()
-                            await loc.click(timeout=3000)
-                            clicked = True
-                            break
+                            if await loc.is_visible():
+                                await loc.scroll_into_view_if_needed()
+                                await loc.click(timeout=3000)
+                                clicked = True
+                                clicked_selector = sel
+                                break
                         except Exception:
                             continue
+
                 if not clicked:
                     # Fallback enter keypress
                     await page.keyboard.press("Enter")
-                return {"success": True, "action": action_type, "clicked": clicked}
+                    clicked_selector = "Enter_key"
+
+                # State Verification Phase: Wait up to 3.5s for URL change, DOM change, or validation error
+                transition_verified = False
+                validation_error_msg = None
+                poll_start = time.time()
+
+                while time.time() - poll_start < 3.5:
+                    await page.wait_for_timeout(300)
+                    if page.is_closed():
+                        break
+
+                    # 1. Check for on-screen survey validation errors FIRST
+                    err_text = await page.evaluate("""() => {
+                        const errSelectors = [
+                            '.error', '.ValidationError', '.error-message', '.cf-error',
+                            '[aria-invalid="true"]', '.has-error', '.survey-error'
+                        ];
+                        for (const sel of errSelectors) {
+                            const el = document.querySelector(sel);
+                            if (el && el.offsetParent !== null) {
+                                const txt = (el.innerText || el.textContent || '').trim();
+                                if (txt.length > 0 && txt.length < 200) return txt;
+                            }
+                        }
+                        return null;
+                    }""")
+                    if err_text:
+                        validation_error_msg = err_text
+                        transition_verified = False
+                        break
+
+                    # 2. Check for URL change
+                    current_url = page.url
+                    if current_url != initial_url:
+                        transition_verified = True
+                        break
+
+                    # 3. Check for DOM transition
+                    current_content = await page.evaluate("document.body ? document.body.innerText.slice(0, 300) : ''")
+                    if current_content and current_content != initial_content:
+                        transition_verified = True
+                        break
+
+                info.last_active = time.time()
+                info.url = page.url
+
+                if transition_verified:
+                    log_copilot_event(
+                        "ACTION_RESULT",
+                        chat_id=info.chat_id,
+                        user_id=user_id,
+                        session_id=info.session_id,
+                        action="advance",
+                        result="TRANSITION_VERIFIED",
+                        url=page.url
+                    )
+                    return {
+                        "success": True,
+                        "action": "advance",
+                        "verified": True,
+                        "clicked_selector": clicked_selector,
+                        "url": page.url
+                    }
+                elif validation_error_msg:
+                    log_copilot_event(
+                        "ACTION_RESULT",
+                        chat_id=info.chat_id,
+                        user_id=user_id,
+                        session_id=info.session_id,
+                        action="advance",
+                        result="VALIDATION_ERROR",
+                        details={"error_msg": validation_error_msg}
+                    )
+                    return {
+                        "success": False,
+                        "error": f"Page validation error: '{validation_error_msg}'. Please answer required questions using /fill <answer> first."
+                    }
+                else:
+                    log_copilot_event(
+                        "ACTION_RESULT",
+                        chat_id=info.chat_id,
+                        user_id=user_id,
+                        session_id=info.session_id,
+                        action="advance",
+                        result="UNVERIFIED",
+                        details={"clicked_selector": clicked_selector}
+                    )
+                    return {
+                        "success": False,
+                        "error": "Clicked Next, but no page transition occurred. An unanswered question or captcha may require attention. Use /snap to inspect the page."
+                    }
 
             elif action_type == "fill":
-                selector = payload.get("selector", 'input[type="text"], input:not([type]), textarea')
-                value = payload.get("value", "")
-                loc = page.locator(selector).first
-                if await loc.count() > 0:
-                    try:
-                        await loc.scroll_into_view_if_needed()
-                    except Exception:
-                        pass
-                    await loc.fill(value)
-                    return {"success": True, "action": action_type, "filled": value}
-                return {"success": False, "error": f"Target input '{selector}' not found."}
+                value = (payload.get("value") or "").strip()
+                if not value:
+                    return {"success": False, "error": "Fill value cannot be empty. Usage: /fill <your answer text>"}
+
+                # Search for target input: prioritizes invalid/required/empty inputs
+                target_info = await page.evaluate("""() => {
+                    const inputs = Array.from(document.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="checkbox"]):not([type="radio"]), textarea'));
+                    const visible = inputs.filter(el => {
+                        const style = window.getComputedStyle(el);
+                        return style && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' && el.offsetParent !== null && !el.disabled && !el.readOnly;
+                    });
+
+                    if (visible.length === 0) return null;
+
+                    // 1. Element with error or invalid state
+                    const invalidEl = visible.find(el => el.getAttribute('aria-invalid') === 'true' || el.classList.contains('error') || el.closest('.error, .ValidationError, .has-error'));
+                    if (invalidEl) {
+                        invalidEl.setAttribute('data-copilot-target', 'true');
+                        return {
+                            name: invalidEl.getAttribute('aria-label') || invalidEl.getAttribute('placeholder') || invalidEl.name || invalidEl.id || 'required field',
+                            selector: '[data-copilot-target="true"]'
+                        };
+                    }
+
+                    // 2. Element marked required and empty
+                    const reqEmptyEl = visible.find(el => (el.required || el.getAttribute('aria-required') === 'true') && (!el.value || el.value.trim() === ''));
+                    if (reqEmptyEl) {
+                        reqEmptyEl.setAttribute('data-copilot-target', 'true');
+                        return {
+                            name: reqEmptyEl.getAttribute('aria-label') || reqEmptyEl.getAttribute('placeholder') || reqEmptyEl.name || reqEmptyEl.id || 'required field',
+                            selector: '[data-copilot-target="true"]'
+                        };
+                    }
+
+                    // 3. First empty visible element
+                    const emptyEl = visible.find(el => !el.value || el.value.trim() === '');
+                    if (emptyEl) {
+                        emptyEl.setAttribute('data-copilot-target', 'true');
+                        return {
+                            name: emptyEl.getAttribute('aria-label') || emptyEl.getAttribute('placeholder') || emptyEl.name || emptyEl.id || 'text field',
+                            selector: '[data-copilot-target="true"]'
+                        };
+                    }
+
+                    // 4. Default to first visible element
+                    visible[0].setAttribute('data-copilot-target', 'true');
+                    return {
+                        name: visible[0].getAttribute('aria-label') || visible[0].getAttribute('placeholder') || visible[0].name || visible[0].id || 'input field',
+                        selector: '[data-copilot-target="true"]'
+                    };
+                }""")
+
+                if not target_info:
+                    log_copilot_event(
+                        "ACTION_RESULT",
+                        chat_id=info.chat_id,
+                        user_id=user_id,
+                        session_id=info.session_id,
+                        action="fill",
+                        result="NO_INPUT_FOUND"
+                    )
+                    return {
+                        "success": False,
+                        "error": "No empty or required text input field found on the current page. If this is a multiple-choice question, use /snap to inspect."
+                    }
+
+                target_sel = target_info["selector"]
+                field_label = target_info["name"]
+
+                loc = page.locator(target_sel).first
+                await loc.scroll_into_view_if_needed()
+                await loc.fill(value)
+                await loc.dispatch_event("input")
+                await loc.dispatch_event("change")
+
+                actual_val = await loc.input_value()
+                await page.evaluate("""() => {
+                    const el = document.querySelector('[data-copilot-target="true"]');
+                    if (el) el.removeAttribute('data-copilot-target');
+                }""")
+
+                info.last_active = time.time()
+                if actual_val == value:
+                    log_copilot_event(
+                        "ACTION_RESULT",
+                        chat_id=info.chat_id,
+                        user_id=user_id,
+                        session_id=info.session_id,
+                        action="fill",
+                        result="FILLED_VERIFIED",
+                        details={"field_name": field_label}
+                    )
+                    return {
+                        "success": True,
+                        "action": "fill",
+                        "field_name": field_label,
+                        "verified": True
+                    }
+                else:
+                    return {
+                        "success": False,
+                        "error": f"Fill attempted on '{field_label}', but actual value '{actual_val}' did not match intended input."
+                    }
 
             elif action_type == "click":
                 selector = payload.get("selector", "")
@@ -222,6 +732,7 @@ class RemoteSessionManager:
                     except Exception:
                         pass
                     await loc.click(timeout=3000)
+                    info.last_active = time.time()
                     return {"success": True, "action": action_type}
                 return {"success": False, "error": f"Element '{selector or text}' not found."}
 
@@ -229,15 +740,20 @@ class RemoteSessionManager:
                 dismiss_btn = page.locator('button:has-text("OK"), button:has-text("Dismiss"), button:has-text("Close"), .modal-close').first
                 if await dismiss_btn.count() > 0:
                     await dismiss_btn.click(timeout=3000)
+                    info.last_active = time.time()
                     return {"success": True, "action": action_type}
                 return {"success": False, "error": "No dismiss button found."}
 
-            elif action_type == "snapshot":
-                shot = await page.screenshot(type="png")
-                return {"success": True, "action": action_type, "screenshot": shot}
-
             return {"success": False, "error": f"Unknown action type '{action_type}'."}
         except Exception as e:
+            log_copilot_event(
+                "ACTION_EXCEPTION",
+                chat_id=info.chat_id,
+                user_id=user_id,
+                session_id=info.session_id,
+                action=action_type,
+                error=str(e)
+            )
             return {"success": False, "error": str(e)}
 
 
@@ -365,10 +881,28 @@ class RemoteCloudInterventionProvider(HumanInterventionProvider):
         reason: str = "",
         status_callback: Optional[Callable[[str], Awaitable[None]]] = None,
         timeout_seconds: int = 300,
+        chat_id: Optional[Union[str, int]] = None,
         **kwargs
     ) -> bool:
-        session_id = f"session_{page_num}_{int(time.time())}"
-        RemoteSessionManager.register_session(session_id, page)
+        chat_key = str(chat_id or getattr(page, "_chat_id", None) or "default")
+        session_id = f"session_{chat_key}_{page_num}"
+
+        # 1. Register or validate the live remote session BEFORE sending Co-Pilot message
+        info = RemoteSessionManager.get_session_info(chat_id=chat_key)
+        if not info:
+            RemoteSessionManager.register_session(
+                session_id=session_id,
+                page=page,
+                chat_id=chat_key,
+                page_num=page_num,
+                state="PAUSED_CO_PILOT"
+            )
+        else:
+            RemoteSessionManager.mark_session_paused(
+                chat_id=chat_key,
+                page_num=page_num,
+                reason=reason
+            )
 
         print("\n" + "=" * 72)
         print(f"CLOUD CO-PILOT MODE ACTIVE (Page {page_num})")
@@ -387,6 +921,7 @@ class RemoteCloudInterventionProvider(HumanInterventionProvider):
         except Exception:
             pass
 
+        # 2. Send intervention prompt ONLY after session is registered and available
         if status_callback:
             try:
                 msg = (
@@ -401,7 +936,6 @@ class RemoteCloudInterventionProvider(HumanInterventionProvider):
                     f"  👉 Reply `/snap` to request an updated screenshot.\n\n"
                     f"⚡ Stillbot will verify the state change and automatically resume!"
                 )
-                # Attempt to pass screenshot if callback accepts it, else standard message
                 try:
                     await status_callback(msg, photo=proof_bytes)
                 except TypeError:
@@ -437,6 +971,7 @@ class RemoteCloudInterventionProvider(HumanInterventionProvider):
                 current_url = page.url
                 if current_url != initial_url:
                     _safe_print(f"🎉 Remote URL transition verified ({current_url})! Resuming cloud automation...")
+                    RemoteSessionManager.mark_session_resumed(chat_id=chat_key, page_num=page_num + 1)
                     if status_callback:
                         try:
                             await status_callback(f"✅ **Remote transition verified!** Resuming automation on Page {page_num + 1}...")
@@ -449,6 +984,7 @@ class RemoteCloudInterventionProvider(HumanInterventionProvider):
                 current_html = await page.evaluate("document.body ? document.body.innerText.slice(0, 300) : ''")
                 if current_html and current_html != initial_html:
                     _safe_print("🎉 Remote DOM transition verified! Resuming cloud automation...")
+                    RemoteSessionManager.mark_session_resumed(chat_id=chat_key, page_num=page_num)
                     if status_callback:
                         try:
                             await status_callback(f"✅ **Remote DOM transition verified!** Resuming automation...")
@@ -458,7 +994,8 @@ class RemoteCloudInterventionProvider(HumanInterventionProvider):
                     return True
 
         finally:
-            RemoteSessionManager.unregister_session(session_id)
+            # DO NOT DELETE SESSION HERE: Session stays alive for ongoing survey execution!
+            pass
 
 
 def get_intervention_provider(mode: Optional[str] = None) -> HumanInterventionProvider:

@@ -16,6 +16,9 @@ load_dotenv()
 # Define conversation states
 LINK, EMAIL, INSTRUCTIONS, PROXY_CHOICE = range(4)
 
+ACTIVE_SURVEY_TASKS = {}
+CURRENT_RUN_TASK = None
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 **Welcome to Stillbot Autonomous Filler!**\n\n"
@@ -344,8 +347,18 @@ async def start_execution(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
-    global CURRENT_RUN_TASK
-    CURRENT_RUN_TASK = asyncio.current_task()
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else None
+
+    # Guard: Prevent parallel runs in the same chat
+    if chat_id in ACTIVE_SURVEY_TASKS and not ACTIVE_SURVEY_TASKS[chat_id].done():
+        await update.message.reply_text(
+            "⚠️ **A survey run is already active in this chat!**\n\n"
+            "• Use `/snap` to see the current cloud screen\n"
+            "• Use `/next` to advance or `/fill <text>` to answer\n"
+            "• Reply `/stop` to cancel it before starting a fresh run."
+        )
+        return ConversationHandler.END
 
     choice = update.message.text.strip()
     is_two_stage = "Two-Stage" in choice or "VoiceFive" in choice
@@ -469,7 +482,8 @@ async def start_execution(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 run_index=idx,
                 status_callback=send_status,
                 user_email=e,
-                timezone=run_tz
+                timezone=run_tz,
+                chat_id=chat_id
             )
             
             # Extract answers, exit reason, and screenshot
@@ -535,96 +549,112 @@ async def start_execution(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "final_page": "Error"
             }
 
-    # Execute all emails sequentially to protect RAM (<400MB) and ensure pristine isolation
-    results = []
-    for idx, e in enumerate(emails, 1):
-        res = await safe_run_bot(idx, e)
-        if e and "Success" in res.get("status", ""):
-            mark_email_used(e)
-        results.append(res)
-    
-    # Compile Master Summary
-    master_summary_text = (
-        f"✅ **Batch Job Completed for {len(emails)} run(s)!**\n\n"
-        f"📍 **Summary of 1:1 Verified Runs:**\n\n"
-    )
-    
-    for idx, res in enumerate(results, 1):
-        master_summary_text += f"==============================\n"
-        master_summary_text += f"📧 Run {idx}: {res['email']}\n"
-        master_summary_text += f"🌐 Assigned IP: `{res['ip']}`\n"
-        master_summary_text += f"📍 Location: {res['city']}, {res['region']} (ZIP: {res['zip']})\n"
-        master_summary_text += f"🏢 ISP: {res['isp']}\n"
-        master_summary_text += f"📊 Status: {res['status']}\n"
-        if res.get('final_url'):
-            master_summary_text += f"🔗 Link: {res['final_url']}\n"
-        if res.get('final_page'):
-            master_summary_text += f"📍 Stage: Page {res['final_page']}\n"
-        if res.get('reward'):
-            rw = res['reward']
-            master_summary_text += f"🎁 Reward: {rw.get('status')} ({rw.get('reward_url')})\n"
-        if res['summary']:
-            for key, value in res['summary'].items():
-                master_summary_text += f"• {key}: {value}\n"
-        master_summary_text += f"==============================\n\n"
-        
-    async def _safe_send(send_coro_fn):
-        for attempt in range(1, 4):
-            try:
-                return await send_coro_fn()
-            except Exception as send_err:
-                if attempt == 3:
-                    print(f"⚠️ Could not send Telegram update after 3 attempts: {send_err}")
-                    return None
-                await asyncio.sleep(1.5 * attempt)
-
-    reply_markup = ReplyKeyboardMarkup([['/start']], resize_keyboard=True, one_time_keyboard=False)
-    
-    if len(master_summary_text) > 4000:
-        with open("batch_summary.txt", "w", encoding="utf-8") as f:
-            f.write(master_summary_text)
-        await _safe_send(lambda: update.message.reply_text(f"✅ Batch Job Completed ({len(results)} runs)!\nThe summary is too long to send as a message, so I've attached it as a file:", reply_markup=reply_markup))
-        with open("batch_summary.txt", "rb") as f:
-            doc_data = f.read()
-        await _safe_send(lambda: update.message.reply_document(doc_data, filename="batch_summary.txt"))
-    else:
-        await _safe_send(lambda: update.message.reply_text(master_summary_text, reply_markup=reply_markup))
-        
-    # Send screenshot proofs to Telegram for each completed run
-    for res in results:
-        shot_path = res.get("screenshot") or "artifacts/final_survey_result.png"
-        if not os.path.exists(shot_path):
-            shot_path = "artifacts/final_survey_result.png"
+    async def run_batch_job():
+        try:
+            results = []
+            for idx, e in enumerate(emails, 1):
+                res = await safe_run_bot(idx, e)
+                if e and "Success" in res.get("status", ""):
+                    mark_email_used(e)
+                results.append(res)
             
-        if os.path.exists(shot_path):
-            try:
-                with open(shot_path, "rb") as photo_file:
-                    photo_bytes = photo_file.read()
-                caption = (
-                    f"📸 **Visual Proof for {res['email']}**\n"
-                    f"• Status: {res['status']}\n"
-                    f"• IP: `{res['ip']}` ({res['city']}, {res['region']})"
-                )
-                await _safe_send(lambda: update.message.reply_photo(photo=photo_bytes, caption=caption))
-            except Exception as e:
-                print(f"⚠️ Could not read or send screenshot proof: {e}")
-
-        # Send reward claim screenshot proof if available
-        if res.get("reward") and res["reward"].get("proof_path"):
-            rw_proof = res["reward"]["proof_path"]
-            if os.path.exists(rw_proof):
-                try:
-                    with open(rw_proof, "rb") as photo_file:
-                        rw_photo_bytes = photo_file.read()
-                    caption = (
-                        f"🎁 **Reward Claim Proof for {res['email']}**\n"
-                        f"• Status: {res['reward'].get('status')}\n"
-                        f"• URL: {res['reward'].get('reward_url')}"
-                    )
-                    await _safe_send(lambda: update.message.reply_photo(photo=rw_photo_bytes, caption=caption))
-                except Exception as e:
-                    print(f"⚠️ Could not read or send reward screenshot proof: {e}")
+            # Compile Master Summary
+            master_summary_text = (
+                f"✅ **Batch Job Completed for {len(emails)} run(s)!**\n\n"
+                f"📍 **Summary of 1:1 Verified Runs:**\n\n"
+            )
             
+            for idx, res in enumerate(results, 1):
+                master_summary_text += f"==============================\n"
+                master_summary_text += f"📧 Run {idx}: {res['email']}\n"
+                master_summary_text += f"🌐 Assigned IP: `{res['ip']}`\n"
+                master_summary_text += f"📍 Location: {res['city']}, {res['region']} (ZIP: {res['zip']})\n"
+                master_summary_text += f"🏢 ISP: {res['isp']}\n"
+                master_summary_text += f"📊 Status: {res['status']}\n"
+                if res.get('final_url'):
+                    master_summary_text += f"🔗 Link: {res['final_url']}\n"
+                if res.get('final_page'):
+                    master_summary_text += f"📍 Stage: Page {res['final_page']}\n"
+                if res.get('reward'):
+                    rw = res['reward']
+                    master_summary_text += f"🎁 Reward: {rw.get('status')} ({rw.get('reward_url')})\n"
+                if res['summary']:
+                    for key, value in res['summary'].items():
+                        master_summary_text += f"• {key}: {value}\n"
+                master_summary_text += f"==============================\n\n"
+                
+            async def _safe_send(send_coro_fn):
+                for attempt in range(1, 4):
+                    try:
+                        return await send_coro_fn()
+                    except Exception as send_err:
+                        if attempt == 3:
+                            print(f"⚠️ Could not send Telegram update after 3 attempts: {send_err}")
+                            return None
+                        await asyncio.sleep(1.5 * attempt)
+
+            reply_markup = ReplyKeyboardMarkup([['/start']], resize_keyboard=True, one_time_keyboard=False)
+            
+            if len(master_summary_text) > 4000:
+                with open("batch_summary.txt", "w", encoding="utf-8") as f:
+                    f.write(master_summary_text)
+                await _safe_send(lambda: update.message.reply_text(f"✅ Batch Job Completed ({len(results)} runs)!\nThe summary is too long to send as a message, so I've attached it as a file:", reply_markup=reply_markup))
+                with open("batch_summary.txt", "rb") as f:
+                    doc_data = f.read()
+                await _safe_send(lambda: update.message.reply_document(doc_data, filename="batch_summary.txt"))
+            else:
+                await _safe_send(lambda: update.message.reply_text(master_summary_text, reply_markup=reply_markup))
+                
+            # Send screenshot proofs to Telegram for each completed run
+            for res in results:
+                shot_path = res.get("screenshot") or "artifacts/final_survey_result.png"
+                if not os.path.exists(shot_path):
+                    shot_path = "artifacts/final_survey_result.png"
+                    
+                if os.path.exists(shot_path):
+                    try:
+                        with open(shot_path, "rb") as photo_file:
+                            photo_bytes = photo_file.read()
+                        caption = (
+                            f"📸 **Visual Proof for {res['email']}**\n"
+                            f"• Status: {res['status']}\n"
+                            f"• IP: `{res['ip']}` ({res['city']}, {res['region']})"
+                        )
+                        await _safe_send(lambda: update.message.reply_photo(photo=photo_bytes, caption=caption))
+                    except Exception as e:
+                        print(f"⚠️ Could not read or send screenshot proof: {e}")
+
+                # Send reward claim screenshot proof if available
+                if res.get("reward") and res["reward"].get("proof_path"):
+                    rw_proof = res["reward"]["proof_path"]
+                    if os.path.exists(rw_proof):
+                        try:
+                            with open(rw_proof, "rb") as photo_file:
+                                rw_photo_bytes = photo_file.read()
+                            caption = (
+                                f"🎁 **Reward Claim Proof for {res['email']}**\n"
+                                f"• Status: {res['reward'].get('status')}\n"
+                                f"• URL: {res['reward'].get('reward_url')}"
+                            )
+                            await _safe_send(lambda: update.message.reply_photo(photo=rw_photo_bytes, caption=caption))
+                        except Exception as e:
+                            print(f"⚠️ Could not read or send reward screenshot proof: {e}")
+        except asyncio.CancelledError:
+            print(f"🛑 Survey batch task for chat {chat_id} was cancelled.")
+        except Exception as err:
+            print(f"❌ Error in survey pipeline for chat {chat_id}: {err}")
+        finally:
+            ACTIVE_SURVEY_TASKS.pop(chat_id, None)
+            from run_mode import RemoteSessionManager
+            RemoteSessionManager.unregister_session(chat_id=chat_id, reason="PIPELINE_COMPLETE")
+            global ACTIVE_RUN_INFO, CURRENT_RUN_TASK
+            ACTIVE_RUN_INFO = None
+            CURRENT_RUN_TASK = None
+
+    task = asyncio.create_task(run_batch_job())
+    ACTIVE_SURVEY_TASKS[chat_id] = task
+    global CURRENT_RUN_TASK
+    CURRENT_RUN_TASK = task
     return ConversationHandler.END
 
 # ==============================================================================
@@ -709,51 +739,82 @@ async def handle_ad_selection(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ==============================================================================
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global CURRENT_RUN_TASK
-    if CURRENT_RUN_TASK and not CURRENT_RUN_TASK.done():
+    chat_id = update.effective_chat.id
+    from run_mode import RemoteSessionManager, log_copilot_event
+    log_copilot_event("COMMAND_CANCEL", chat_id=chat_id)
+    RemoteSessionManager.unregister_session(chat_id=chat_id, reason="USER_STOPPED")
+    task = ACTIVE_SURVEY_TASKS.pop(chat_id, None)
+    if task and not task.done():
         try:
-            CURRENT_RUN_TASK.cancel()
+            task.cancel()
         except Exception:
             pass
-        CURRENT_RUN_TASK = None
-        reply_markup = ReplyKeyboardMarkup([['/start']], resize_keyboard=True, one_time_keyboard=False)
-        await update.message.reply_text("🛑 **SURVEY STOPPED!** The active browser session was terminated immediately.", reply_markup=reply_markup)
-        return ConversationHandler.END
-
+    global CURRENT_RUN_TASK, ACTIVE_RUN_INFO
+    CURRENT_RUN_TASK = None
+    ACTIVE_RUN_INFO = None
     reply_markup = ReplyKeyboardMarkup([['/start']], resize_keyboard=True, one_time_keyboard=False)
-    await update.message.reply_text("🛑 Setup cancelled. Tap /start to try again.", reply_markup=reply_markup)
+    await update.message.reply_text("🛑 **SURVEY STOPPED!** The active browser session was terminated immediately.", reply_markup=reply_markup)
     return ConversationHandler.END
 
 async def remote_next_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Remote Cloud Co-Pilot command: advance the active cloud survey session."""
-    from run_mode import RemoteSessionManager
-    res = await RemoteSessionManager.dispatch_remote_action("advance")
-    if res.get("success"):
-        await update.message.reply_text("⚡ Clicked Next/Advance on the cloud browser! Waiting for state transition verification...")
-    else:
-        await update.message.reply_text(f"⚠️ Remote advance note: {res.get('error', 'Action failed')}")
+    from run_mode import RemoteSessionManager, log_copilot_event
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else None
+    log_copilot_event("UPDATE_RECEIVED", chat_id=chat_id, user_id=user_id, command="/next")
+
+    try:
+        res = await RemoteSessionManager.dispatch_remote_action("advance", chat_id=chat_id, user_id=user_id)
+        if res.get("success"):
+            new_url = res.get("url", "")
+            url_part = f"\n🔗 Current URL: `{new_url}`" if new_url else ""
+            await update.message.reply_text(f"⚡ Clicked Next/Advance on the cloud browser! State transition verified.{url_part}", parse_mode="Markdown")
+        else:
+            await update.message.reply_text(f"⚠️ Remote advance note: {res.get('error', 'Action failed')}")
+    except Exception as e:
+        log_copilot_event("COMMAND_EXCEPTION", chat_id=chat_id, user_id=user_id, command="/next", error=str(e))
+        await update.message.reply_text(f"⚠️ Command error: {e}")
 
 async def remote_snap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Remote Cloud Co-Pilot command: capture and send an updated screenshot of the cloud session."""
-    from run_mode import RemoteSessionManager
-    res = await RemoteSessionManager.dispatch_remote_action("snapshot")
-    if res.get("success") and res.get("screenshot"):
-        await update.message.reply_photo(photo=res["screenshot"], caption="📸 Current Live Cloud Browser Screen")
-    else:
-        await update.message.reply_text(f"⚠️ Could not capture snapshot: {res.get('error', 'No active session')}")
+    from run_mode import RemoteSessionManager, log_copilot_event
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else None
+    log_copilot_event("UPDATE_RECEIVED", chat_id=chat_id, user_id=user_id, command="/snap")
+
+    try:
+        res = await RemoteSessionManager.dispatch_remote_action("snapshot", chat_id=chat_id, user_id=user_id)
+        if res.get("success") and res.get("screenshot"):
+            caption = f"📸 Live Cloud Browser (Page {res.get('page_num', '?')})\n🔗 {res.get('url', '')}"
+            await update.message.reply_photo(photo=res["screenshot"], caption=caption)
+        else:
+            await update.message.reply_text(f"⚠️ Could not capture snapshot: {res.get('error', 'No active session')}")
+    except Exception as e:
+        log_copilot_event("COMMAND_EXCEPTION", chat_id=chat_id, user_id=user_id, command="/snap", error=str(e))
+        await update.message.reply_text(f"⚠️ Command error: {e}")
 
 async def remote_fill_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Remote Cloud Co-Pilot command: fill text into the active cloud browser field."""
-    from run_mode import RemoteSessionManager
+    from run_mode import RemoteSessionManager, log_copilot_event
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else None
     text = " ".join(context.args) if context.args else ""
+    log_copilot_event("UPDATE_RECEIVED", chat_id=chat_id, user_id=user_id, command="/fill", details={"arg_len": len(text)})
+
     if not text:
-        await update.message.reply_text("Usage: `/fill <your answer text>`", parse_mode="Markdown")
+        await update.message.reply_text("Usage: `/fill <your answer text>`\nExample: `/fill 35` or `/fill Male`", parse_mode="Markdown")
         return
-    res = await RemoteSessionManager.dispatch_remote_action("fill", payload={"value": text})
-    if res.get("success"):
-        await update.message.reply_text(f"✍️ Filled '{text}' on cloud browser! Reply `/next` to submit/advance.")
-    else:
-        await update.message.reply_text(f"⚠️ Fill failed: {res.get('error')}")
+
+    try:
+        res = await RemoteSessionManager.dispatch_remote_action("fill", payload={"value": text}, chat_id=chat_id, user_id=user_id)
+        if res.get("success"):
+            field_name = res.get("field_name", "target field")
+            await update.message.reply_text(f"✍️ Successfully filled '{text}' into {field_name}!\nReply `/next` to submit or advance.")
+        else:
+            await update.message.reply_text(f"⚠️ Fill failed: {res.get('error')}")
+    except Exception as e:
+        log_copilot_event("COMMAND_EXCEPTION", chat_id=chat_id, user_id=user_id, command="/fill", error=str(e))
+        await update.message.reply_text(f"⚠️ Command error: {e}")
 
 def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -785,6 +846,7 @@ def main():
         Application.builder()
         .token(token)
         .request(request)
+        .concurrent_updates(True)
         .post_init(post_init)
         .build()
     )
