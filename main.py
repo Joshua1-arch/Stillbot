@@ -2443,7 +2443,15 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
                 # 4b. Query LLM with only the legitimate non-other choices!
                 run_ctx.transition_state(PageState.ANSWER_GENERATION)
                 if ai_fields:
-                    answers = await get_form_answers(ai_fields, session_memory, validation_errors=current_validation_errors, persona=run_persona, run_context=run_ctx)
+                    try:
+                        answers = await asyncio.wait_for(
+                            get_form_answers(ai_fields, session_memory, validation_errors=current_validation_errors, persona=run_persona, run_context=run_ctx),
+                            timeout=40.0
+                        )
+                    except (asyncio.TimeoutError, Exception) as ai_err:
+                        print(f"⏱️ AI Engine overall timeout or error: {ai_err}. Engaging fast heuristic fallback...")
+                        from ai_engine import validate_answer_set
+                        answers, _, _ = validate_answer_set(ai_fields, {}, run_context=run_ctx, session_memory=session_memory, persona=run_persona)
                 else:
                     answers = {}
                 answers.update(pre_filled_answers)

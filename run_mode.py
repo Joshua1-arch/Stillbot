@@ -1024,6 +1024,9 @@ class RemoteSessionManager:
                 # 8. ADVANCE (Next / Continue / Submit)
                 # ------------------------------------------------------------------
                 elif action_type in ["advance", "next", "continue", "submit"]:
+                    # Unblock any paused copilot loops
+                    info.pause_event.set()
+                    
                     initial_url = page.url
                     initial_content = ""
                     try:
@@ -1033,12 +1036,13 @@ class RemoteSessionManager:
 
                     selectors = [
                         '#NextButton', 'button#NextButton', 'input#NextButton',
-                        'button.NextButton', 'input.NextButton', '.NextButton', '.next-button',
+                        'button.NextButton', 'input.NextButton', '.NextButton', '.next-button', '.next-btn',
                         '.cf-navigation-next', 'button.cf-navigation-next', '.cf-navigation__button',
                         'button[type="submit"]', 'input[type="submit"]',
+                        'button:has-text("Next page")', 'button:has-text("Next Page")',
                         'button:has-text("Next")', 'button:has-text("Continue")', 'button:has-text("Submit")',
                         'button:has-text("Proceed")', 'button:has-text("Start")',
-                        '[data-action*="next" i]', '[data-action*="submit" i]'
+                        '[data-action*="next" i]', '[data-action*="submit" i]', '[aria-label*="next" i]'
                     ]
                     clicked = False
                     clicked_selector = None

@@ -9,8 +9,8 @@ from rapidfuzz import process, fuzz
 import config
 from run_context import RunContext, NormalizedQuestion
 
-# Initialize OpenAI Client to use Lily (Poolot)
-client = AsyncOpenAI(api_key=config.LILY_API_KEY, base_url="https://agent.poolot.com/v1")
+# Initialize OpenAI Client to use Lily (Poolot) with bounded timeout
+client = AsyncOpenAI(api_key=config.LILY_API_KEY, base_url="https://agent.poolot.com/v1", timeout=25.0)
 
 def generate_dynamic_schema(fields: List[Dict]) -> type[BaseModel]:
     """
@@ -359,6 +359,22 @@ def _attempt_field_resolution_fallback(
             "status": "ANSWERED",
             "reason": "Sequential ranking ordering inferred from available options"
         }
+
+    # 7. Rating / Likert / Importance Matrix Scale Fallback Deduction
+    role = field.get("role", "textbox")
+    f_type = field.get("type", "text")
+    if options and (role == "radio" or f_type in ["radio", "scale", "matrix"]):
+        importance_opts = [o for o in options if any(k in o.lower() for k in ["important", "agree", "5", "4", "extremely", "very"])]
+        if importance_opts:
+            top_positive = [o for o in options if any(k in o.lower() for k in ["extremely important", "very important", "5", "4", "strongly agree", "agree"])]
+            chosen = top_positive[0] if top_positive else options[-1]
+            return {
+                "value": chosen,
+                "confidence": 0.85,
+                "source": "deduced",
+                "status": "ANSWERED",
+                "reason": "Contextual importance/agreement rating fallback deduction"
+            }
 
     return None
 
@@ -746,13 +762,16 @@ async def _get_form_answers_single_chunk(
                 # Estimate prompt tokens roughly
                 run_context.token_metrics["prompt_tokens_est"] += len(prompt) // 4
                 
-            response = await client.chat.completions.create(
-                model="poolot-standard",
-                messages=[
-                    {"role": "system", "content": "You are an expert form filler. Map answers meticulously. Output ONLY valid JSON."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.3
+            response = await asyncio.wait_for(
+                client.chat.completions.create(
+                    model="poolot-standard",
+                    messages=[
+                        {"role": "system", "content": "You are an expert form filler. Map answers meticulously. Output ONLY valid JSON."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.3
+                ),
+                timeout=25.0
             )
             raw_content = response.choices[0].message.content if (response and response.choices and len(response.choices) > 0) else None
             if raw_content and raw_content.strip():
@@ -963,23 +982,26 @@ async def get_vision_form_answers(image_path: str, num_boxes: int, session_memor
     """
     
     try:
-        response = await client.beta.chat.completions.parse(
-            model="poolot-vision",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/png;base64,{base64_image}"
+        response = await asyncio.wait_for(
+            client.beta.chat.completions.parse(
+                model="poolot-vision",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{base64_image}"
+                                }
                             }
-                        }
-                    ]
-                }
-            ],
-            response_format=VisionResponse,
+                        ]
+                    }
+                ],
+                response_format=VisionResponse,
+            ),
+            timeout=25.0
         )
         return response.choices[0].message.parsed.model_dump()
     except Exception as e:
@@ -999,20 +1021,23 @@ async def extract_instructions_from_image(image_path: str) -> str:
             "Write out the explicit instructions, rules, or context found in the image clearly so "
             "the bot can use it to intelligently deduce the best answers for a questionnaire."
         )
-        response = await client.chat.completions.create(
-            model="poolot-vision",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Extract all instructions, context, or guides from this image."},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
-                    ]
-                }
-            ],
-            temperature=0.2,
-            max_tokens=1024,
+        response = await asyncio.wait_for(
+            client.chat.completions.create(
+                model="poolot-vision",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Extract all instructions, context, or guides from this image."},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
+                        ]
+                    }
+                ],
+                temperature=0.2,
+                max_tokens=1024,
+            ),
+            timeout=25.0
         )
         extracted_text = response.choices[0].message.content.strip()
         print(f"✅ Vision extracted instructions:\n{extracted_text}")
