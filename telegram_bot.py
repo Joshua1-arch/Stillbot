@@ -724,6 +724,37 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🛑 Setup cancelled. Tap /start to try again.", reply_markup=reply_markup)
     return ConversationHandler.END
 
+async def remote_next_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remote Cloud Co-Pilot command: advance the active cloud survey session."""
+    from run_mode import RemoteSessionManager
+    res = await RemoteSessionManager.dispatch_remote_action("advance")
+    if res.get("success"):
+        await update.message.reply_text("⚡ Clicked Next/Advance on the cloud browser! Waiting for state transition verification...")
+    else:
+        await update.message.reply_text(f"⚠️ Remote advance note: {res.get('error', 'Action failed')}")
+
+async def remote_snap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remote Cloud Co-Pilot command: capture and send an updated screenshot of the cloud session."""
+    from run_mode import RemoteSessionManager
+    res = await RemoteSessionManager.dispatch_remote_action("snapshot")
+    if res.get("success") and res.get("screenshot"):
+        await update.message.reply_photo(photo=res["screenshot"], caption="📸 Current Live Cloud Browser Screen")
+    else:
+        await update.message.reply_text(f"⚠️ Could not capture snapshot: {res.get('error', 'No active session')}")
+
+async def remote_fill_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remote Cloud Co-Pilot command: fill text into the active cloud browser field."""
+    from run_mode import RemoteSessionManager
+    text = " ".join(context.args) if context.args else ""
+    if not text:
+        await update.message.reply_text("Usage: `/fill <your answer text>`", parse_mode="Markdown")
+        return
+    res = await RemoteSessionManager.dispatch_remote_action("fill", payload={"value": text})
+    if res.get("success"):
+        await update.message.reply_text(f"✍️ Filled '{text}' on cloud browser! Reply `/next` to submit/advance.")
+    else:
+        await update.message.reply_text(f"⚠️ Fill failed: {res.get('error')}")
+
 def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token or token == "YOUR_TELEGRAM_TOKEN_HERE":
@@ -767,6 +798,10 @@ def main():
     application.add_handler(CommandHandler("checkads", checkads_command))
     application.add_handler(CommandHandler("screenshot", screenshot_command))
     application.add_handler(CommandHandler("stop", cancel))
+    # Remote Cloud Co-Pilot controls
+    application.add_handler(CommandHandler("next", remote_next_command))
+    application.add_handler(CommandHandler("snap", remote_snap_command))
+    application.add_handler(CommandHandler("fill", remote_fill_command))
     # -------------------------------------------------------------
 
     conv_handler = ConversationHandler(

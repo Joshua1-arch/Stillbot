@@ -1006,73 +1006,18 @@ async def wait_for_human_copilot(page, page_num: int, reason: str = "", status_c
     """
     Co-Pilot Mode (Human-in-the-Loop):
     Pauses autonomous automation without closing the browser and without burning any AI credits.
-    Allows the user to answer questions or click Next directly on their screen.
-    Monitors the page for URL or DOM changes, and automatically resumes once the user advances the page.
-    Bounded by timeout_seconds (default 300s = 5 minutes).
+    Delegates to the configured HumanInterventionProvider (Local desktop or Remote cloud)
+    based on the resolved STILLBOT_RUN_MODE.
     """
-    print("\n" + "═" * 72)
-    print(f"🤝 CO-PILOT MODE ACTIVE (Page {page_num})")
-    print("═" * 72)
-    print(f"💡 Reason: {reason or 'Bot paused to prevent token waste and assist navigation'}")
-    print("👉 Look at your Chrome screen: Answer any missed fields or click Next!")
-    print("👀 The bot is watching live and will AUTO-RESUME as soon as you advance.")
-    print("═" * 72 + "\n")
-    
-    if status_callback:
-        try:
-            await status_callback(
-                f"🤝 **Co-Pilot Assistance Needed on Page {page_num}**\n\n"
-                f"• {reason or 'Bot needs assistance on this page.'}\n"
-                f"• **AI credit spending is paused.**\n"
-                f"• 🔗 Live Survey URL: `{page.url}`\n\n"
-                f"👉 **Please click Next or answer directly in the open Chrome browser.**\n"
-                f"⚡ The bot will automatically detect when the page advances and resume!"
-            )
-        except Exception:
-            pass
-
-    initial_url = page.url
-    try:
-        initial_html = await page.evaluate("document.body ? document.body.innerText.slice(0, 300) : ''")
-    except Exception:
-        initial_html = ""
-
-    start_time = asyncio.get_event_loop().time()
-    # Monitor every 1.5 seconds with bounded timeout and ZERO AI token consumption
-    while True:
-        elapsed = asyncio.get_event_loop().time() - start_time
-        if timeout_seconds and elapsed > timeout_seconds:
-            print(f"⏱️ Co-Pilot timeout ({timeout_seconds}s) reached on Page {page_num}.")
-            if status_callback:
-                try:
-                    await status_callback(f"⏱️ **Co-Pilot Timeout on Page {page_num}:** Exceeded {timeout_seconds}s waiting for human advance.")
-                except Exception:
-                    pass
-            return False
-
-        try:
-            await page.wait_for_timeout(1500)
-            if page.is_closed():
-                print("⚠️ Browser was closed during Co-Pilot mode.")
-                return False
-
-            current_url = page.url
-            if current_url != initial_url:
-                print(f"🎉 URL change detected ({current_url})! User advanced the page.")
-                print("🚀 Co-Pilot: Resuming automated bot...")
-                await page.wait_for_timeout(2000)
-                return True
-
-            current_html = await page.evaluate("document.body ? document.body.innerText.slice(0, 300) : ''")
-            if current_html and current_html != initial_html:
-                print("🎉 DOM transition detected! User advanced the page.")
-                print("🚀 Co-Pilot: Resuming automated bot...")
-                await page.wait_for_timeout(2000)
-                return True
-        except Exception as e:
-            if "closed" in str(e).lower():
-                return False
-            await page.wait_for_timeout(1500)
+    from run_mode import get_intervention_provider
+    provider = get_intervention_provider()
+    return await provider.request_intervention(
+        page=page,
+        page_num=page_num,
+        reason=reason,
+        status_callback=status_callback,
+        timeout_seconds=timeout_seconds
+    )
 
 async def find_advance_button(page):
     """
@@ -1845,11 +1790,17 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
     
     exit_reason = ""
     async with async_playwright() as p:
-        # On Linux/Render servers without physical display, force headless=True
-        if os.name != "nt":
+        from run_mode import resolve_run_mode, validate_and_log_run_mode, RunMode
+        run_mode_info = validate_and_log_run_mode()
+        active_mode = run_mode_info["resolved_mode"]
+
+        if active_mode == RunMode.CLOUD.value:
             is_headless = True
+            chrome_channel = None
         else:
+            # Local PC mode: Visible local Chrome/Chromium window by default
             is_headless = os.getenv("HEADLESS", "False").lower() == "true"
+            chrome_channel = "chrome" if (os.name == "nt" and os.path.exists(r"C:\Program Files\Google\Chrome\Application\chrome.exe")) else None
 
         import tempfile
         import shutil
@@ -1933,7 +1884,8 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
             ctx_kwargs["permissions"] = ["geolocation"]
 
         # Determine whether to use Google Chrome channel or bundled Chromium
-        chrome_channel = "chrome" if os.name == "nt" else None
+        if 'chrome_channel' not in locals():
+            chrome_channel = "chrome" if os.name == "nt" else None
 
         try:
             kwargs = dict(launch_args)

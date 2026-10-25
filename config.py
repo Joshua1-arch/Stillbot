@@ -5,6 +5,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- Core Settings ---
+# Run Mode: 'auto', 'local', or 'cloud'
+STILLBOT_RUN_MODE = os.getenv("STILLBOT_RUN_MODE", "auto").strip().lower()
+from run_mode import resolve_run_mode, validate_and_log_run_mode, get_intervention_provider, RunMode
+
 # If True, the bot will not click the final submit button.
 DRY_RUN = os.getenv("DRY_RUN", "False").lower() == "true"
 ENABLE_VISION_FALLBACK = os.getenv("ENABLE_VISION_FALLBACK", "True").lower() == "true"
