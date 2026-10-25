@@ -44,6 +44,8 @@ class StrategyType(str, Enum):
     LABEL_CLICK = "label_click"
     LOCATOR_DRAG = "locator_drag"
     POINTER_GESTURE = "pointer_gesture"
+    HTML5_SYNTHETIC_DRAG = "html5_synthetic_drag"
+    KEYBOARD_REORDER = "keyboard_reorder"
     SELECT_OPTION = "select_option"
     ARIA_OPTION_CLICK = "aria_option_click"
     SLIDER_SEEK = "slider_seek"
@@ -711,12 +713,92 @@ class RankingHandler(WidgetHandler):
         return field.get("role") == "ranking" or field.get("type") == "ranking"
 
     def plan_interaction(self, inspection: WidgetInspection, value: Any, learned_strategies: List[StrategyType]) -> List[StrategyType]:
-        default = [StrategyType.LOCATOR_DRAG, StrategyType.POINTER_GESTURE]
+        default = [
+            StrategyType.LOCATOR_DRAG,
+            StrategyType.POINTER_GESTURE,
+            StrategyType.HTML5_SYNTHETIC_DRAG,
+            StrategyType.KEYBOARD_REORDER
+        ]
         for s in reversed(learned_strategies):
             if s in default:
                 default.remove(s)
                 default.insert(0, s)
         return default
+
+    @classmethod
+    async def inspect_interactive_items(cls, page: Page, inspection: Optional[WidgetInspection] = None) -> Dict[str, Any]:
+        """
+        Discovers draggable items and target dropzones/ranking slots on the page.
+        Returns stable session-scoped identifiers for Telegram Co-Pilot controls (/items, /drag, /move).
+        """
+        container_id = inspection.element_id if inspection else None
+        target_drop_id = inspection.target_container_id if inspection else None
+
+        raw = await page.evaluate("""(data) => {
+            const containerId = data ? data.containerId : null;
+            const targetDropId = data ? data.targetDropId : null;
+            let container = containerId ? document.querySelector(`[data-stillbot-id="${containerId}"]`) : null;
+            if (!container) {
+                container = document.querySelector('.Group.Ranked, .ui-sortable, [data-widget="ranking"], ul.sortable, .ranking-container, [role="list"]') || document.body;
+            }
+
+            // 1. Draggable / Rankable Items
+            const itemSelectors = 'li, [draggable="true"], .rank-item, .sortable-item, .draggable-row, .Selection, [data-choice-id], [role="listitem"]';
+            const allItems = Array.from(container.querySelectorAll(itemSelectors)).filter(el => {
+                if (el.offsetParent === null) return false;
+                const txt = (el.innerText || el.textContent || '').trim();
+                return txt.length > 0 && !el.matches('.handle, .drag-handle');
+            });
+
+            const items = allItems.map((el, idx) => {
+                const clone = el.cloneNode(true);
+                clone.querySelectorAll('.handle, .drag-handle, .ui-sortable-handle, [class*="handle" i]').forEach(h => h.remove());
+                const cleanText = clone.innerText.replace(/^\\d+[\\.\\s\\-:]+/, '').trim();
+                const rect = el.getBoundingClientRect();
+                el.setAttribute('data-copilot-item-id', String(idx + 1));
+                return {
+                    id: String(idx + 1),
+                    label: cleanText || `Item ${idx + 1}`,
+                    selector: `[data-copilot-item-id="${idx + 1}"]`,
+                    index: idx + 1,
+                    bounding_box: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
+                };
+            });
+
+            // 2. Drop Targets / Buckets / Slots
+            let dropzones = [];
+            const dzEls = Array.from(document.querySelectorAll('.Group.Ranked, .dropzone, [data-widget="dropzone"], ul.Ranked, .target-bucket, .bucket, .drop-target, [aria-dropeffect]')).filter(el => el.offsetParent !== null);
+            
+            if (dzEls.length > 0) {
+                dropzones = dzEls.map((dz, idx) => {
+                    const rect = dz.getBoundingClientRect();
+                    dz.setAttribute('data-copilot-target-id', `target_${idx + 1}`);
+                    const title = dz.getAttribute('aria-label') || dz.getAttribute('title') || dz.innerText.slice(0, 30).trim() || `Target Zone ${idx + 1}`;
+                    return {
+                        id: `target_${idx + 1}`,
+                        label: title,
+                        selector: `[data-copilot-target-id="target_${idx + 1}"]`,
+                        index: idx + 1,
+                        bounding_box: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
+                    };
+                });
+            } else {
+                // If pure re-ordering, targets are position slots 1..N
+                dropzones = items.map(it => ({
+                    id: String(it.index),
+                    label: `Position ${it.index}`,
+                    selector: it.selector,
+                    index: it.index,
+                    bounding_box: it.bounding_box
+                }));
+            }
+
+            return { items: items, targets: dropzones };
+        }""", {
+            "containerId": container_id,
+            "targetDropId": target_drop_id
+        })
+        return raw or {"items": [], "targets": []}
 
     async def execute(self, page: Page, inspection: WidgetInspection, strategy: StrategyType, value: Any) -> ExecutionAttempt:
         start_t = time.time()
@@ -755,6 +837,7 @@ class RankingHandler(WidgetHandler):
                     f'[data-stillbot-id="{inspection.element_id}"] li, [data-stillbot-id="{inspection.element_id}"] [draggable="true"], [data-stillbot-id="{inspection.element_id}"] .sortable-item, '
                     f'.ui-sortable li, .ui-sortable [draggable="true"], .ui-sortable .sortable-item, .ui-sortable .rank-item'
                 )
+                
                 if strategy == StrategyType.LOCATOR_DRAG:
                     if target_dropzone and await target_dropzone.count() > 0:
                         await source_loc.drag_to(target_dropzone, timeout=4000)
@@ -763,6 +846,7 @@ class RankingHandler(WidgetHandler):
                         if await slot.count() > 0:
                             await source_loc.drag_to(slot, timeout=4000)
                     await page.wait_for_timeout(300)
+
                 elif strategy == StrategyType.POINTER_GESTURE:
                     s_box = await source_loc.bounding_box()
                     t_box = None
@@ -783,6 +867,37 @@ class RankingHandler(WidgetHandler):
                         await page.mouse.move(tx, ty)
                         await page.mouse.up()
                         await page.wait_for_timeout(300)
+
+                elif strategy == StrategyType.HTML5_SYNTHETIC_DRAG:
+                    # Synthetic HTML5 DragEvent sequence with DataTransfer
+                    target_loc = target_dropzone if (target_dropzone and await target_dropzone.count() > 0) else page.locator(slot_sel).nth(rank_idx)
+                    if await target_loc.count() > 0:
+                        await page.evaluate("""({src, tgt}) => {
+                            const dt = new DataTransfer();
+                            ['dragstart'].forEach(ev => src.dispatchEvent(new DragEvent(ev, { bubbles: true, cancelable: true, dataTransfer: dt })));
+                            ['dragenter', 'dragover', 'drop'].forEach(ev => tgt.dispatchEvent(new DragEvent(ev, { bubbles: true, cancelable: true, dataTransfer: dt })));
+                            ['dragend'].forEach(ev => src.dispatchEvent(new DragEvent(ev, { bubbles: true, cancelable: true, dataTransfer: dt })));
+                            return true;
+                        }""", {"src": await source_loc.element_handle(), "tgt": await target_loc.element_handle()})
+                        await page.wait_for_timeout(300)
+
+                elif strategy == StrategyType.KEYBOARD_REORDER:
+                    try:
+                        await source_loc.focus()
+                        await page.keyboard.press("Space")
+                        cur_idx = await source_loc.evaluate("""el => {
+                            const p = el.parentElement;
+                            return p ? Array.from(p.children).indexOf(el) : 0;
+                        }""")
+                        delta = rank_idx - cur_idx
+                        k = "ArrowDown" if delta > 0 else "ArrowUp"
+                        for _ in range(abs(delta)):
+                            await page.keyboard.press(k)
+                            await page.wait_for_timeout(100)
+                        await page.keyboard.press("Space")
+                        await page.wait_for_timeout(300)
+                    except Exception:
+                        pass
                         
             return ExecutionAttempt(strategy=strategy, success=True, duration_ms=(time.time() - start_t) * 1000)
         except Exception as e:
@@ -794,11 +909,17 @@ class RankingHandler(WidgetHandler):
         
         ranked_dom_items = await page.evaluate("""(data) => {
             let container = data.targetDropId ? document.querySelector(`[data-stillbot-id="${data.targetDropId}"]`) : null;
+            if (!container) {
+                container = document.querySelector('.Group.Ranked, .dropzone, [data-widget="dropzone"], ul.Ranked, .target-bucket');
+            }
             if (!container && data.containerId) {
                 container = document.querySelector(`[data-stillbot-id="${data.containerId}"]`);
             }
             if (!container && data.realId) {
                 container = document.getElementById(data.realId);
+            }
+            if (!container) {
+                container = document.querySelector('.ui-sortable, [data-widget="ranking"], ul.sortable, .ranking-container');
             }
             if (!container) return [];
             const items = Array.from(container.querySelectorAll('li, [draggable="true"], .rank-item, .sortable-item, .draggable-row, .Selection, [data-choice-id]'));
@@ -820,7 +941,7 @@ class RankingHandler(WidgetHandler):
             elif any(exp in d or d in exp for d in dom_clean):
                 matches += 1
                 
-        if matches >= min(len(exp_clean), 1):
+        if matches >= min(len(exp_clean), 1) and len(dom_clean) > 0:
             return VerificationResult(control_type="ranking", expected_state=expected_value, actual_state=ranked_dom_items, is_verified=True)
             
         return VerificationResult(control_type="ranking", expected_state=expected_value, actual_state=ranked_dom_items, is_verified=False, failure_reason=f"DOM items {ranked_dom_items} != expected {expected_value}")

@@ -23,6 +23,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 **Welcome to Stillbot Autonomous Filler!**\n\n"
         "Send me a **Questionnaire Link** to begin setup, or use these commands:\n"
+        "• `/help` — 📖 Full remote command and Co-Pilot reference\n"
+        "• `/status` — 📊 Check active survey session state\n"
         "• `/checkads` — 🔍 Scan Facebook Ad Library for new Shareablee ads\n"
         "• `/screenshot` — 📸 Capture live browser screenshot\n"
         "• `/pool` — 📊 Check email pool count\n"
@@ -468,11 +470,17 @@ async def start_execution(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(emails) > 1:
             instance_instructions += f"\nBATCH ITERATION {idx}: Executing run {idx} for account {e}. Strictly adhere to confirmed respondent facts.\n"
             
-        async def send_status(msg: str):
+        async def send_status(msg: str, photo=None, reply_markup=None):
             try:
-                await update.message.reply_text(msg, parse_mode="Markdown")
+                if photo:
+                    await update.message.reply_photo(photo=photo, caption=msg, parse_mode="Markdown", reply_markup=reply_markup)
+                else:
+                    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=reply_markup)
             except Exception:
-                pass
+                try:
+                    await update.message.reply_text(msg, reply_markup=reply_markup)
+                except Exception:
+                    pass
 
         try:
             res_data = await run_bot(
@@ -738,22 +746,70 @@ async def handle_ad_selection(update: Update, context: ContextTypes.DEFAULT_TYPE
         return EMAIL
 # ==============================================================================
 
+import inspect
+
+async def _send_copilot_response(update: Update, text: str = None, photo: bytes = None, caption: str = None, parse_mode: str = None, reply_markup=None):
+    """Safely dispatches response whether update came from a direct text command or inline keyboard callback."""
+    cb = getattr(update, "callback_query", None)
+    msg = getattr(update, "message", None)
+    
+    # If update.message exists (direct command or mock update), prioritize replying to message
+    target = msg
+    if target is None and cb is not None:
+        target = getattr(cb, "message", None)
+        ans = getattr(cb, "answer", None)
+        if callable(ans):
+            try:
+                res = ans()
+                if inspect.isawaitable(res):
+                    await res
+            except Exception:
+                pass
+
+    if target is None:
+        return
+
+    if photo:
+        send_fn = getattr(target, "reply_photo", None)
+        if callable(send_fn):
+            res = send_fn(photo=photo, caption=caption, parse_mode=parse_mode, reply_markup=reply_markup)
+            if inspect.isawaitable(res):
+                await res
+    elif text:
+        send_fn = getattr(target, "reply_text", None)
+        if callable(send_fn):
+            res = send_fn(text, parse_mode=parse_mode, reply_markup=reply_markup)
+            if inspect.isawaitable(res):
+                await res
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Emergency stop and cancellation for the invoking user's active session.
+    Idempotent, safe against repeated calls, and guarantees per-user isolation.
+    """
     chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else None
     from run_mode import RemoteSessionManager, log_copilot_event
-    log_copilot_event("COMMAND_CANCEL", chat_id=chat_id)
-    RemoteSessionManager.unregister_session(chat_id=chat_id, reason="USER_STOPPED")
+    log_copilot_event("COMMAND_CANCEL", chat_id=chat_id, user_id=user_id)
+
+    # Terminate the remote browser session & clean up resources
+    term_res = await RemoteSessionManager.terminate_session(chat_id=chat_id, user_id=user_id, reason="USER_STOPPED")
+
+    # Cancel active background survey task if still tracked
     task = ACTIVE_SURVEY_TASKS.pop(chat_id, None)
     if task and not task.done():
         try:
             task.cancel()
         except Exception:
             pass
+
     global CURRENT_RUN_TASK, ACTIVE_RUN_INFO
     CURRENT_RUN_TASK = None
     ACTIVE_RUN_INFO = None
+
     reply_markup = ReplyKeyboardMarkup([['/start']], resize_keyboard=True, one_time_keyboard=False)
-    await update.message.reply_text("🛑 **SURVEY STOPPED!** The active browser session was terminated immediately.", reply_markup=reply_markup)
+    msg = f"🛑 **SURVEY STOPPED!** {term_res.get('message', 'The active browser session was terminated immediately.')}"
+    await _send_copilot_response(update, text=msg, parse_mode="Markdown", reply_markup=reply_markup)
     return ConversationHandler.END
 
 async def remote_next_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -768,12 +824,15 @@ async def remote_next_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         if res.get("success"):
             new_url = res.get("url", "")
             url_part = f"\n🔗 Current URL: `{new_url}`" if new_url else ""
-            await update.message.reply_text(f"⚡ Clicked Next/Advance on the cloud browser! State transition verified.{url_part}", parse_mode="Markdown")
+            msg = f"⚡ Clicked Next/Advance on the cloud browser! State transition verified.{url_part}"
         else:
-            await update.message.reply_text(f"⚠️ Remote advance note: {res.get('error', 'Action failed')}")
+            msg = f"⚠️ Remote advance note: {res.get('error', 'Action failed')}"
+
+        await _send_copilot_response(update, text=msg, parse_mode="Markdown")
     except Exception as e:
         log_copilot_event("COMMAND_EXCEPTION", chat_id=chat_id, user_id=user_id, command="/next", error=str(e))
-        await update.message.reply_text(f"⚠️ Command error: {e}")
+        err_msg = f"⚠️ Command error: {e}"
+        await _send_copilot_response(update, text=err_msg)
 
 async def remote_snap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Remote Cloud Co-Pilot command: capture and send an updated screenshot of the cloud session."""
@@ -786,12 +845,14 @@ async def remote_snap_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         res = await RemoteSessionManager.dispatch_remote_action("snapshot", chat_id=chat_id, user_id=user_id)
         if res.get("success") and res.get("screenshot"):
             caption = f"📸 Live Cloud Browser (Page {res.get('page_num', '?')})\n🔗 {res.get('url', '')}"
-            await update.message.reply_photo(photo=res["screenshot"], caption=caption)
+            await _send_copilot_response(update, photo=res["screenshot"], caption=caption)
         else:
-            await update.message.reply_text(f"⚠️ Could not capture snapshot: {res.get('error', 'No active session')}")
+            err_msg = f"⚠️ Could not capture snapshot: {res.get('error', 'No active session')}"
+            await _send_copilot_response(update, text=err_msg)
     except Exception as e:
         log_copilot_event("COMMAND_EXCEPTION", chat_id=chat_id, user_id=user_id, command="/snap", error=str(e))
-        await update.message.reply_text(f"⚠️ Command error: {e}")
+        err_msg = f"⚠️ Command error: {e}"
+        await _send_copilot_response(update, text=err_msg)
 
 async def remote_fill_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Remote Cloud Co-Pilot command: fill text into the active cloud browser field."""
@@ -802,19 +863,212 @@ async def remote_fill_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     log_copilot_event("UPDATE_RECEIVED", chat_id=chat_id, user_id=user_id, command="/fill", details={"arg_len": len(text)})
 
     if not text:
-        await update.message.reply_text("Usage: `/fill <your answer text>`\nExample: `/fill 35` or `/fill Male`", parse_mode="Markdown")
+        await _send_copilot_response(update, text="Usage: `/fill <your answer text>`\nExample: `/fill 35` or `/fill Male`", parse_mode="Markdown")
         return
 
     try:
         res = await RemoteSessionManager.dispatch_remote_action("fill", payload={"value": text}, chat_id=chat_id, user_id=user_id)
         if res.get("success"):
             field_name = res.get("field_name", "target field")
-            await update.message.reply_text(f"✍️ Successfully filled '{text}' into {field_name}!\nReply `/next` to submit or advance.")
+            await _send_copilot_response(update, text=f"✍️ Successfully filled '{text}' into {field_name}!\nReply `/next` to submit or advance.")
         else:
-            await update.message.reply_text(f"⚠️ Fill failed: {res.get('error')}")
+            await _send_copilot_response(update, text=f"⚠️ Fill failed: {res.get('error')}")
     except Exception as e:
         log_copilot_event("COMMAND_EXCEPTION", chat_id=chat_id, user_id=user_id, command="/fill", error=str(e))
-        await update.message.reply_text(f"⚠️ Command error: {e}")
+        await _send_copilot_response(update, text=f"⚠️ Command error: {e}")
+
+async def remote_items_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remote Cloud Co-Pilot command: list detected interactive items and drop targets with stable IDs."""
+    from run_mode import RemoteSessionManager, log_copilot_event
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else None
+    log_copilot_event("UPDATE_RECEIVED", chat_id=chat_id, user_id=user_id, command="/items")
+
+    try:
+        res = await RemoteSessionManager.dispatch_remote_action("items", chat_id=chat_id, user_id=user_id)
+        if res.get("success"):
+            text = res.get("formatted_text", "No interactive items detected.")
+            await _send_copilot_response(update, text=text, parse_mode="Markdown")
+        else:
+            err_msg = f"⚠️ Items inspection note: {res.get('error', 'Action failed')}"
+            await _send_copilot_response(update, text=err_msg)
+    except Exception as e:
+        log_copilot_event("COMMAND_EXCEPTION", chat_id=chat_id, user_id=user_id, command="/items", error=str(e))
+        await _send_copilot_response(update, text=f"⚠️ Command error: {e}")
+
+async def remote_drag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remote Cloud Co-Pilot command: drag an item into a destination drop target."""
+    from run_mode import RemoteSessionManager, log_copilot_event
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else None
+    args = context.args or []
+    log_copilot_event("UPDATE_RECEIVED", chat_id=chat_id, user_id=user_id, command="/drag", details={"args": args})
+
+    if len(args) < 2:
+        await _send_copilot_response(update, text="Usage: `/drag <item_id> <target_id>`\nExample: `/drag 1 target_1`\nUse `/items` to check valid identifiers.", parse_mode="Markdown")
+        return
+
+    item_id, target_id = args[0], args[1]
+    try:
+        res = await RemoteSessionManager.dispatch_remote_action("drag", payload={"item_id": item_id, "target_id": target_id}, chat_id=chat_id, user_id=user_id)
+        if res.get("success"):
+            await _send_copilot_response(update, text=f"🎯 Successfully dragged item `{item_id}` to target `{target_id}`!\nReply `/next` when all items are placed.", parse_mode="Markdown")
+        else:
+            await _send_copilot_response(update, text=f"⚠️ Drag failed: {res.get('error')}")
+    except Exception as e:
+        log_copilot_event("COMMAND_EXCEPTION", chat_id=chat_id, user_id=user_id, command="/drag", error=str(e))
+        await _send_copilot_response(update, text=f"⚠️ Command error: {e}")
+
+async def remote_move_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remote Cloud Co-Pilot command: move an item to a ranking position slot."""
+    from run_mode import RemoteSessionManager, log_copilot_event
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else None
+    args = context.args or []
+    log_copilot_event("UPDATE_RECEIVED", chat_id=chat_id, user_id=user_id, command="/move", details={"args": args})
+
+    if len(args) < 2:
+        await _send_copilot_response(update, text="Usage: `/move <item_id> <position>`\nExample: `/move 3 1` to move item 3 to rank position 1.\nUse `/items` to inspect current order.", parse_mode="Markdown")
+        return
+
+    item_id, position = args[0], args[1]
+    try:
+        res = await RemoteSessionManager.dispatch_remote_action("move", payload={"item_id": item_id, "position": position}, chat_id=chat_id, user_id=user_id)
+        if res.get("success"):
+            await _send_copilot_response(update, text=f"🎯 Moved item `{item_id}` to rank `{position}`!\nReply `/next` when ranking is complete.", parse_mode="Markdown")
+        else:
+            await _send_copilot_response(update, text=f"⚠️ Move failed: {res.get('error')}")
+    except Exception as e:
+        log_copilot_event("COMMAND_EXCEPTION", chat_id=chat_id, user_id=user_id, command="/move", error=str(e))
+        await _send_copilot_response(update, text=f"⚠️ Command error: {e}")
+
+async def remote_click_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remote Cloud Co-Pilot command: click an identified element on screen."""
+    from run_mode import RemoteSessionManager, log_copilot_event
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else None
+    args = context.args or []
+    log_copilot_event("UPDATE_RECEIVED", chat_id=chat_id, user_id=user_id, command="/click", details={"args": args})
+
+    if not args:
+        await _send_copilot_response(update, text="Usage: `/click <target_id>`\nUse `/items` to see interactive elements.", parse_mode="Markdown")
+        return
+
+    target_id = " ".join(args)
+    try:
+        res = await RemoteSessionManager.dispatch_remote_action("click", payload={"target_id": target_id}, chat_id=chat_id, user_id=user_id)
+        if res.get("success"):
+            await _send_copilot_response(update, text=f"🖱️ Clicked `{target_id}` on the cloud browser.")
+        else:
+            await _send_copilot_response(update, text=f"⚠️ Click failed: {res.get('error')}")
+    except Exception as e:
+        log_copilot_event("COMMAND_EXCEPTION", chat_id=chat_id, user_id=user_id, command="/click", error=str(e))
+        await _send_copilot_response(update, text=f"⚠️ Command error: {e}")
+
+async def remote_pause_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remote Cloud Co-Pilot command: pause automated survey execution while preserving active browser session."""
+    from run_mode import RemoteSessionManager, log_copilot_event
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else None
+    log_copilot_event("UPDATE_RECEIVED", chat_id=chat_id, user_id=user_id, command="/pause")
+
+    try:
+        res = await RemoteSessionManager.dispatch_remote_action("pause", chat_id=chat_id, user_id=user_id)
+        msg = f"⏸️ {res.get('message', 'Automation paused.')}" if res.get("success") else f"⚠️ Pause note: {res.get('error')}"
+        await _send_copilot_response(update, text=msg)
+    except Exception as e:
+        log_copilot_event("COMMAND_EXCEPTION", chat_id=chat_id, user_id=user_id, command="/pause", error=str(e))
+        await _send_copilot_response(update, text=f"⚠️ Command error: {e}")
+
+async def remote_resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remote Cloud Co-Pilot command: resume paused automated survey execution."""
+    from run_mode import RemoteSessionManager, log_copilot_event
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else None
+    log_copilot_event("UPDATE_RECEIVED", chat_id=chat_id, user_id=user_id, command="/resume")
+
+    try:
+        res = await RemoteSessionManager.dispatch_remote_action("resume", chat_id=chat_id, user_id=user_id)
+        msg = f"▶️ {res.get('message', 'Automation resumed.')}" if res.get("success") else f"⚠️ Resume note: {res.get('error')}"
+        await _send_copilot_response(update, text=msg)
+    except Exception as e:
+        log_copilot_event("COMMAND_EXCEPTION", chat_id=chat_id, user_id=user_id, command="/resume", error=str(e))
+        await _send_copilot_response(update, text=f"⚠️ Command error: {e}")
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Displays current session state, active page, URL, and runtime mode."""
+    from run_mode import RemoteSessionManager
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else None
+
+    res = await RemoteSessionManager.dispatch_remote_action("status", chat_id=chat_id, user_id=user_id)
+    if res.get("success"):
+        st = res.get("state", "UNKNOWN")
+        pg = res.get("page_num", 1)
+        url = res.get("url", "None")
+        w_info = res.get("active_widget")
+        w_part = f"\n• Active Widget: `{w_info.get('type')}` ({w_info.get('failure_reason', 'waiting')})" if w_info else ""
+        await update.message.reply_text(
+            f"📊 **Stillbot Session Status:**\n"
+            f"• State: **{st}**\n"
+            f"• Current Page: **Page {pg}**\n"
+            f"• Live URL: `{url}`{w_part}\n\n"
+            f"💡 Controls: `/snap`, `/next`, `/fill <text>`, `/items`, `/pause`, `/resume`, `/stop`",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            f"ℹ️ **Status:** No active survey running in this chat.\n"
+            f"Start a new questionnaire with `/start`.",
+            parse_mode="Markdown"
+        )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Displays comprehensive Stillbot remote controls and command documentation."""
+    await update.message.reply_text(
+        "🤖 **Stillbot Remote Co-Pilot Command Reference:**\n\n"
+        "**Session & Setup:**\n"
+        "• `/start` — Start a new survey setup\n"
+        "• `/status` — View current survey state, page number, and URL\n"
+        "• `/help` — Display this command reference\n"
+        "• `/stop` or `/cancel` — Emergency stop active survey and close browser\n\n"
+        "**Remote Browser Navigation:**\n"
+        "• `/snap` — Capture live screenshot of the cloud browser\n"
+        "• `/next` — Click Next / Submit button with state verification\n"
+        "• `/fill <text>` — Fill identified question field with your answer\n"
+        "• `/pause` — Pause automation while preserving session\n"
+        "• `/resume` — Resume paused automation\n\n"
+        "**Drag-and-Drop & Interactive Widgets:**\n"
+        "• `/items` — List detected draggable items and drop zones\n"
+        "• `/drag <item_id> <target_id>` — Drag item into drop bucket (e.g. `/drag 1 target_1`)\n"
+        "• `/move <item_id> <position>` — Move item to ranking position (e.g. `/move 3 1`)\n"
+        "• `/click <target_id>` — Click detected element by ID\n\n"
+        "**Pool & Tools:**\n"
+        "• `/pool` — View email pool status\n"
+        "• `/addemails` — Add new emails in bulk\n"
+        "• `/checkads` — Scan Facebook Ad Library for Shareablee ads\n\n"
+        "⚡ Stillbot automatically verifies state changes and resumes when possible!",
+        parse_mode="Markdown"
+    )
+
+async def handle_copilot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles inline keyboard button callbacks for remote Co-Pilot interactions."""
+    query = update.callback_query
+    data = query.data
+    if data == "copilot_next":
+        await remote_next_command(update, context)
+    elif data == "copilot_snap":
+        await remote_snap_command(update, context)
+    elif data == "copilot_items":
+        await remote_items_command(update, context)
+    elif data == "copilot_pause":
+        await remote_pause_command(update, context)
+    elif data == "copilot_resume":
+        await remote_resume_command(update, context)
+    elif data == "copilot_stop":
+        await cancel(update, context)
+    else:
+        await query.answer("Unknown action.")
 
 def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -856,15 +1110,25 @@ def main():
     application.add_handler(CommandHandler("addemails", add_emails_command))
     application.add_handler(CommandHandler("pool", pool_status_command))
 
-    # --- New Modular Commands (Safe to comment out if needed) ---
+    # --- New Modular Commands ---
     application.add_handler(CommandHandler("checkads", checkads_command))
     application.add_handler(CommandHandler("screenshot", screenshot_command))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("stop", cancel))
+    application.add_handler(CommandHandler("cancel", cancel))
     # Remote Cloud Co-Pilot controls
     application.add_handler(CommandHandler("next", remote_next_command))
     application.add_handler(CommandHandler("snap", remote_snap_command))
     application.add_handler(CommandHandler("fill", remote_fill_command))
-    # -------------------------------------------------------------
+    application.add_handler(CommandHandler("items", remote_items_command))
+    application.add_handler(CommandHandler("drag", remote_drag_command))
+    application.add_handler(CommandHandler("move", remote_move_command))
+    application.add_handler(CommandHandler("click", remote_click_command))
+    application.add_handler(CommandHandler("pause", remote_pause_command))
+    application.add_handler(CommandHandler("resume", remote_resume_command))
+    application.add_handler(CallbackQueryHandler(handle_copilot_callback, pattern=r"^copilot_"))
+    # -----------------------------
 
     conv_handler = ConversationHandler(
         entry_points=[

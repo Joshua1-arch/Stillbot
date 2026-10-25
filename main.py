@@ -319,7 +319,7 @@ async def verify_control_state(page, field: Dict[str, Any], expected_val: Any) -
             is_verified=False, failure_reason=f"Verification exception: {e}"
         )
 
-async def fill_field(page, field, answer):
+async def fill_field(page, field, answer, page_num=1, status_callback=None):
     """
     Universally fills a field across any survey platform or web framework.
     Handles native HTML, React/Vue/Angular synthetic state, hidden inputs with custom labels,
@@ -862,94 +862,36 @@ async def fill_field(page, field, answer):
                 print(f"⚠️ Signature draw error: {e}")
 
         elif role == "ranking":
-            target_drop_id = field.get("target_container_id")
-            option_map = field.get("option_map", {})
-            target_count = field.get("target_count")
-            
-            # Answer can be list of strings, or comma-separated string, or JSON list
-            ranked_items = []
-            if isinstance(val, list):
-                ranked_items = [str(x).strip() for x in val if str(x).strip()]
-            elif isinstance(val, str):
-                try:
-                    parsed = json.loads(val)
-                    if isinstance(parsed, list):
-                        ranked_items = [str(x).strip() for x in parsed if str(x).strip()]
-                except Exception:
-                    pass
-                if not ranked_items:
-                    ranked_items = [x.strip() for x in val.split("\n") if x.strip()]
-                if not ranked_items:
-                    ranked_items = [x.strip() for x in val.split(",") if x.strip()]
-                    
-            if target_count and len(ranked_items) > target_count:
-                ranked_items = ranked_items[:target_count]
+            from interaction_engine import universal_registry
+            ans_dict = answer if isinstance(answer, dict) else {"value": val}
+            res = await universal_registry.dispatch_fill(page, field, ans_dict)
+            if res.success:
+                print(f"🎯 Ranking completed and verified in DOM using strategy {res.applied_strategy.value if res.applied_strategy else 'drag'}")
+            else:
+                fail_reason = (res.verification.failure_reason if res.verification else None) or res.diagnostics.get('last_error') or "Ranking drag-and-drop verification failed"
+                print(f"⚠️ Ranking interaction failed: {fail_reason}")
+                from run_mode import RemoteSessionManager
+                chat_k = getattr(page, "_chat_id", None)
+                info = RemoteSessionManager.get_session_info(chat_id=chat_k)
+                w_info = {
+                    "type": "ranking",
+                    "field": field,
+                    "failure_reason": fail_reason,
+                    "page_num": page_num
+                }
+                if info:
+                    info.active_widget = w_info
                 
-            print(f"🎯 Ranking options to place: {ranked_items}")
-            
-            # Locate target dropzone or sortable container
-            target_dropzone = None
-            if target_drop_id:
-                target_dropzone = page.locator(f'[data-stillbot-id="{target_drop_id}"]').first
-            if not target_dropzone or await target_dropzone.count() == 0:
-                dz = page.locator('.Group.Ranked, .dropzone, [data-widget="dropzone"], ul.Ranked').first
-                if await dz.count() > 0:
-                    target_dropzone = dz
-                    
-            for rank_idx, item_name in enumerate(ranked_items):
-                matched_opt_id = None
-                for opt_text, opt_id in option_map.items():
-                    if opt_text.lower() == item_name.lower() or item_name.lower() in opt_text.lower() or opt_text.lower() in item_name.lower():
-                        matched_opt_id = opt_id
-                        break
-                        
-                source_loc = None
-                if matched_opt_id:
-                    source_loc = page.locator(f'[data-stillbot-id="{matched_opt_id}"]').first
-                if not source_loc or await source_loc.count() == 0:
-                    source_loc = page.locator(f'li:has-text("{item_name}"), [draggable="true"]:has-text("{item_name}"), .sortable-item:has-text("{item_name}"), .draggable-row:has-text("{item_name}"), .Selection:has-text("{item_name}"), .rank-item:has-text("{item_name}")').first
-                    
-                if source_loc and await source_loc.count() > 0:
-                    slot_sel = f'[data-stillbot-id="{field.get("id")}"] li, [data-stillbot-id="{field.get("id")}"] [draggable="true"], [data-stillbot-id="{field.get("id")}"] .sortable-item, .ui-sortable li, .ui-sortable [draggable="true"], .ui-sortable .sortable-item, .ui-sortable .rank-item'
-                    try:
-                        await source_loc.scroll_into_view_if_needed()
-                        if target_dropzone and await target_dropzone.count() > 0:
-                            print(f"🔄 Dragging [{item_name}] into target dropzone...")
-                            await source_loc.drag_to(target_dropzone, timeout=4000)
-                            await page.wait_for_timeout(600)
-                        else:
-                            target_slot = page.locator(slot_sel).nth(rank_idx)
-                            if await target_slot.count() > 0:
-                                print(f"🔄 Reordering [{item_name}] to rank {rank_idx + 1}...")
-                                await source_loc.drag_to(target_slot, timeout=4000)
-                                await page.wait_for_timeout(600)
-                    except Exception as drag_err:
-                        print(f"⚠️ Playwright drag_to failed for [{item_name}]: {drag_err}. Trying pointer simulation...")
-                        try:
-                            source_box = await source_loc.bounding_box()
-                            target_box = None
-                            if target_dropzone and await target_dropzone.count() > 0:
-                                target_box = await target_dropzone.bounding_box()
-                            else:
-                                t_slot = page.locator(slot_sel).nth(rank_idx)
-                                if await t_slot.count() > 0:
-                                    target_box = await t_slot.bounding_box()
-                                    
-                            if source_box and target_box:
-                                sx = source_box["x"] + source_box["width"] / 2
-                                sy = source_box["y"] + source_box["height"] / 2
-                                tx = target_box["x"] + target_box["width"] / 2
-                                ty = target_box["y"] + target_box["height"] / 2
-                                await page.mouse.move(sx, sy)
-                                await page.mouse.down()
-                                for s in range(1, 10):
-                                    await page.mouse.move(sx + (tx - sx) * (s / 10.0), sy + (ty - sy) * (s / 10.0))
-                                    await page.wait_for_timeout(30)
-                                await page.mouse.move(tx, ty)
-                                await page.mouse.up()
-                                await page.wait_for_timeout(600)
-                        except Exception as ptr_err:
-                            print(f"⚠️ Pointer drag simulation failed: {ptr_err}")
+                print(f"🤝 Triggering Co-Pilot assistance for failed ranking widget...")
+                resumed = await wait_for_human_copilot(
+                    page,
+                    page_num=page_num,
+                    reason=f"Widget '{field.get('label') or 'Ranking'}' could not be automatically placed: {fail_reason}",
+                    status_callback=status_callback,
+                    widget_info=w_info
+                )
+                if resumed:
+                    print("✅ Co-Pilot resumed after ranking widget assistance.")
 
         elif role == "slider":
             from interaction_engine import universal_registry
@@ -958,7 +900,21 @@ async def fill_field(page, field, answer):
             if res.success:
                 print(f"🎯 Slider set to '{val}' using strategy {res.applied_strategy.value if res.applied_strategy else 'seek'}")
             else:
-                print(f"⚠️ Slider interaction failed: {res.diagnostics.get('last_error')}")
+                fail_reason = (res.verification.failure_reason if res.verification else None) or res.diagnostics.get('last_error') or "Slider seek failed"
+                print(f"⚠️ Slider interaction failed: {fail_reason}")
+                if field.get("required"):
+                    from run_mode import RemoteSessionManager
+                    chat_k = getattr(page, "_chat_id", None)
+                    info = RemoteSessionManager.get_session_info(chat_id=chat_k)
+                    w_info = {"type": "slider", "field": field, "failure_reason": fail_reason, "page_num": page_num}
+                    if info:
+                        info.active_widget = w_info
+                    await wait_for_human_copilot(
+                        page, page_num=page_num,
+                        reason=f"Slider '{field.get('label') or 'range'}' failed: {fail_reason}",
+                        status_callback=status_callback,
+                        widget_info=w_info
+                    )
 
         elif role in ["date_time", "datepicker", "timepicker"]:
             from interaction_engine import universal_registry
@@ -967,7 +923,21 @@ async def fill_field(page, field, answer):
             if res.success:
                 print(f"🎯 Date/Time set to '{val}' using strategy {res.applied_strategy.value if res.applied_strategy else 'fill'}")
             else:
-                print(f"⚠️ Date/Time interaction failed: {res.diagnostics.get('last_error')}")
+                fail_reason = (res.verification.failure_reason if res.verification else None) or res.diagnostics.get('last_error') or "Date picker failed"
+                print(f"⚠️ Date/Time interaction failed: {fail_reason}")
+                if field.get("required"):
+                    from run_mode import RemoteSessionManager
+                    chat_k = getattr(page, "_chat_id", None)
+                    info = RemoteSessionManager.get_session_info(chat_id=chat_k)
+                    w_info = {"type": "date_time", "field": field, "failure_reason": fail_reason, "page_num": page_num}
+                    if info:
+                        info.active_widget = w_info
+                    await wait_for_human_copilot(
+                        page, page_num=page_num,
+                        reason=f"Date/Time '{field.get('label')}' failed: {fail_reason}",
+                        status_callback=status_callback,
+                        widget_info=w_info
+                    )
 
         elif role == "file_upload":
             from interaction_engine import universal_registry
@@ -976,7 +946,21 @@ async def fill_field(page, field, answer):
             if res.success:
                 print(f"🎯 File uploaded using strategy {res.applied_strategy.value if res.applied_strategy else 'attach'}")
             else:
-                print(f"⚠️ File upload failed: {res.diagnostics.get('last_error')}")
+                fail_reason = (res.verification.failure_reason if res.verification else None) or res.diagnostics.get('last_error') or "File upload failed"
+                print(f"⚠️ File upload failed: {fail_reason}")
+                if field.get("required"):
+                    from run_mode import RemoteSessionManager
+                    chat_k = getattr(page, "_chat_id", None)
+                    info = RemoteSessionManager.get_session_info(chat_id=chat_k)
+                    w_info = {"type": "file_upload", "field": field, "failure_reason": fail_reason, "page_num": page_num}
+                    if info:
+                        info.active_widget = w_info
+                    await wait_for_human_copilot(
+                        page, page_num=page_num,
+                        reason=f"File upload '{field.get('label')}' failed: {fail_reason}",
+                        status_callback=status_callback,
+                        widget_info=w_info
+                    )
 
         else:
             # Standard Textbox / Contenteditable
@@ -1002,7 +986,7 @@ async def fill_field(page, field, answer):
     except Exception as e:
         print(f"❌ Failed to fill field '{name}': {e}")
 
-async def wait_for_human_copilot(page, page_num: int, reason: str = "", status_callback = None, timeout_seconds: int = 300, chat_id = None) -> bool:
+async def wait_for_human_copilot(page, page_num: int, reason: str = "", status_callback = None, timeout_seconds: int = 300, chat_id = None, widget_info = None) -> bool:
     """
     Co-Pilot Mode (Human-in-the-Loop):
     Pauses autonomous automation without closing the browser and without burning any AI credits.
@@ -1018,7 +1002,8 @@ async def wait_for_human_copilot(page, page_num: int, reason: str = "", status_c
         reason=reason,
         status_callback=status_callback,
         timeout_seconds=timeout_seconds,
-        chat_id=resolved_chat
+        chat_id=resolved_chat,
+        widget_info=widget_info
     )
 
 async def find_advance_button(page):
@@ -1934,7 +1919,10 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
             page=page,
             chat_id=chat_key,
             page_num=1,
-            state="RUNNING"
+            state="RUNNING",
+            browser=browser,
+            temp_dir=temp_user_data_dir,
+            dynamic_bridge=dynamic_bridge
         )
         if stealth_async:
             await stealth_async(page)
@@ -2045,6 +2033,20 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
         
         # --- The Universal Autonomous Loop with Explicit Page State & Incremental Scanning ---
         while True:
+            # Check if session is stopping or user-paused
+            info = RemoteSessionManager.get_session_info(chat_id=chat_key, allow_closed=True)
+            if info:
+                if info.is_stopping():
+                    print("🛑 Survey session was stopped. Exiting survey loop.")
+                    exit_reason = "STOPPED_BY_USER"
+                    break
+                if info.state == "PAUSED_USER":
+                    print("⏸️ Survey execution paused by user. Waiting for /resume...")
+                    await info.pause_event.wait()
+                    if info.is_stopping():
+                        exit_reason = "STOPPED_BY_USER"
+                        break
+
             print(f"\n--- Analyzing Page {page_num} ---")
             run_ctx.transition_state(PageState.LOADING)
             await page.wait_for_timeout(1800)
@@ -2869,9 +2871,16 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
             RemoteSessionManager.unregister_session(session_id=session_id, chat_id=chat_key, reason="SURVEY_FINISHED")
         except Exception:
             pass
-        await browser.close()
+        try:
+            if browser and not browser.is_closed():
+                await browser.close()
+        except Exception:
+            pass
         if dynamic_bridge:
-            await dynamic_bridge.stop()
+            try:
+                await dynamic_bridge.stop()
+            except Exception:
+                pass
         try:
             shutil.rmtree(temp_user_data_dir, ignore_errors=True)
         except Exception:
