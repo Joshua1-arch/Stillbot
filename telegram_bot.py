@@ -150,7 +150,7 @@ async def get_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Next, please send me the **Gmail / Email Address(es)** you want the bot to use.\n"
             "(You can send multiple comma-separated emails, e.g. user1@gmail.com, user2@gmail.com)\n\n"
             "💡 *Tip: You can save emails permanently into your pool using `/addemails ...`*\n\n"
-            "If you want the bot to invent a random email or skip, tap **skip**.",
+            "If you want to skip providing an email now, tap **skip**.",
             reply_markup=reply_markup
         )
     return EMAIL
@@ -210,7 +210,7 @@ async def handle_email_callback(update: Update, context: ContextTypes.DEFAULT_TY
             chosen_emails = [pool[i]["email"] for i in sorted(selected_indices) if i < len(pool)]
             if not chosen_emails:
                 context.user_data['email'] = None
-                await query.edit_message_text("✅ No emails selected from pool. The bot will invent an email if needed.")
+                await query.edit_message_text("✅ No emails selected from pool. Proceeding without pre-set email.")
             else:
                 context.user_data['email'] = ", ".join(chosen_emails)
                 emails_display = "\n".join([f"• `{e}`" for e in chosen_emails])
@@ -242,7 +242,7 @@ async def get_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if text.lower() == 'skip':
         context.user_data['email'] = None
-        await update.message.reply_text("✅ Skipping email (the bot will invent one if needed).")
+        await update.message.reply_text("✅ Skipping email (will request if required).")
     else:
         context.user_data['email'] = text
         await update.message.reply_text("✅ Email(s) saved!")
@@ -289,10 +289,18 @@ async def get_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if text.lower() == 'skip':
             context.user_data['instructions'] = None
-            await update.message.reply_text("✅ Skipping instructions. Proceeding with default autonomous brain.")
+            try:
+                await update.message.reply_text("✅ Skipping instructions. Proceeding with default autonomous brain.")
+            except Exception:
+                await asyncio.sleep(1.0)
+                await update.message.reply_text("✅ Skipping instructions. Proceeding with default autonomous brain.")
         else:
             context.user_data['instructions'] = text
-            await update.message.reply_text("✅ Instructions saved!")
+            try:
+                await update.message.reply_text("✅ Instructions saved!")
+            except Exception:
+                await asyncio.sleep(1.0)
+                await update.message.reply_text("✅ Instructions saved!")
             
     # Prompt user to choose connection mode
     reply_markup = ReplyKeyboardMarkup(
@@ -305,14 +313,21 @@ async def get_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         resize_keyboard=True,
         one_time_keyboard=True
     )
-    await update.message.reply_text(
-        "⚡ **Select Connection Mode:**\n\n"
-        "• **🔄 Two-Stage Proxy (VoiceFive Survey)**: *Recommended for VoiceFive!* Starts on Direct Network to pass Verisoul gatekeeper, then dynamically activates US Residential Proxy for all survey questions & location binding.\n"
-        "• **🌐 Residential Proxy (Geonix 1:1)**: Standard 1:1 residential proxy from start to finish.\n"
-        "• **⚡ Direct Network (No Proxy)**: Runs directly on your local network (zero proxy).\n\n"
-        "Choose an option below:",
-        reply_markup=reply_markup
-    )
+    try:
+        await update.message.reply_text(
+            "⚡ **Select Connection Mode:**\n\n"
+            "• **🔄 Two-Stage Proxy (VoiceFive Survey)**: *Recommended for VoiceFive!* Starts on Direct Network to pass Verisoul gatekeeper, then dynamically activates US Residential Proxy for all survey questions & location binding.\n"
+            "• **🌐 Residential Proxy (Geonix 1:1)**: Standard 1:1 residential proxy from start to finish.\n"
+            "• **⚡ Direct Network (No Proxy)**: Runs directly on your local network (zero proxy).\n\n"
+            "Choose an option below:",
+            reply_markup=reply_markup
+        )
+    except Exception:
+        await asyncio.sleep(1.0)
+        await update.message.reply_text(
+            "⚡ **Select Connection Mode:**\n\nChoose an option below:",
+            reply_markup=reply_markup
+        )
     return PROXY_CHOICE
 
 async def start_execution(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -417,8 +432,8 @@ async def start_execution(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"2. For ANY question asking for State, Province, or Region, you MUST select or write: {region_str}\n"
                     f"3. For ANY question asking for City, you MUST write: {city_str}\n"
                     f"4. For ANY question asking for {zip_label}, you MUST write: {zip_str}\n"
-                    f"5. Street Address: You MUST invent an authentic, realistic residential street address located inside {city_str}, {region_str} {zip_str}, {country_name}.\n"
-                    f"6. DO NOT randomize or invent another City, State, or {zip_label}. The survey researcher verifies your submission against your IP geolocation! Any discrepancy will disqualify the survey.\n"
+                    f"5. Street Address: If street address is requested and not provided in persona, do NOT invent a fake or placeholder address. Request clarification or mark unanswerable.\n"
+                    f"6. DO NOT randomize or invent another City, State, or {zip_label}. Ensure consistency with confirmed facts.\n"
                 )
             else:
                 location_binding = ""
@@ -438,7 +453,7 @@ async def start_execution(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if e:
             instance_instructions += f"\nCRITICAL PRIORITY: You MUST use the email address: {e}\n"
         if len(emails) > 1:
-            instance_instructions += f"\nBATCH ITERATION {idx}: You may vary your Name and Age to appear as a unique respondent, but you MUST strictly maintain the City, State, and ZIP matching the IP above.\n"
+            instance_instructions += f"\nBATCH ITERATION {idx}: Executing run {idx} for account {e}. Strictly adhere to confirmed respondent facts.\n"
             
         async def send_status(msg: str):
             try:
@@ -553,16 +568,27 @@ async def start_execution(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 master_summary_text += f"• {key}: {value}\n"
         master_summary_text += f"==============================\n\n"
         
+    async def _safe_send(send_coro_fn):
+        for attempt in range(1, 4):
+            try:
+                return await send_coro_fn()
+            except Exception as send_err:
+                if attempt == 3:
+                    print(f"⚠️ Could not send Telegram update after 3 attempts: {send_err}")
+                    return None
+                await asyncio.sleep(1.5 * attempt)
+
     reply_markup = ReplyKeyboardMarkup([['/start']], resize_keyboard=True, one_time_keyboard=False)
     
     if len(master_summary_text) > 4000:
         with open("batch_summary.txt", "w", encoding="utf-8") as f:
             f.write(master_summary_text)
-        await update.message.reply_text(f"✅ Batch Job Completed ({len(results)} runs)!\nThe summary is too long to send as a message, so I've attached it as a file:", reply_markup=reply_markup)
+        await _safe_send(lambda: update.message.reply_text(f"✅ Batch Job Completed ({len(results)} runs)!\nThe summary is too long to send as a message, so I've attached it as a file:", reply_markup=reply_markup))
         with open("batch_summary.txt", "rb") as f:
-            await update.message.reply_document(f)
+            doc_data = f.read()
+        await _safe_send(lambda: update.message.reply_document(doc_data, filename="batch_summary.txt"))
     else:
-        await update.message.reply_text(master_summary_text, reply_markup=reply_markup)
+        await _safe_send(lambda: update.message.reply_text(master_summary_text, reply_markup=reply_markup))
         
     # Send screenshot proofs to Telegram for each completed run
     for res in results:
@@ -573,14 +599,15 @@ async def start_execution(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if os.path.exists(shot_path):
             try:
                 with open(shot_path, "rb") as photo_file:
-                    caption = (
-                        f"📸 **Visual Proof for {res['email']}**\n"
-                        f"• Status: {res['status']}\n"
-                        f"• IP: `{res['ip']}` ({res['city']}, {res['region']})"
-                    )
-                    await update.message.reply_photo(photo=photo_file, caption=caption)
+                    photo_bytes = photo_file.read()
+                caption = (
+                    f"📸 **Visual Proof for {res['email']}**\n"
+                    f"• Status: {res['status']}\n"
+                    f"• IP: `{res['ip']}` ({res['city']}, {res['region']})"
+                )
+                await _safe_send(lambda: update.message.reply_photo(photo=photo_bytes, caption=caption))
             except Exception as e:
-                print(f"⚠️ Could not send screenshot proof: {e}")
+                print(f"⚠️ Could not read or send screenshot proof: {e}")
 
         # Send reward claim screenshot proof if available
         if res.get("reward") and res["reward"].get("proof_path"):
@@ -588,14 +615,15 @@ async def start_execution(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if os.path.exists(rw_proof):
                 try:
                     with open(rw_proof, "rb") as photo_file:
-                        caption = (
-                            f"🎁 **Reward Claim Proof for {res['email']}**\n"
-                            f"• Status: {res['reward'].get('status')}\n"
-                            f"• URL: {res['reward'].get('reward_url')}"
-                        )
-                        await update.message.reply_photo(photo=photo_file, caption=caption)
+                        rw_photo_bytes = photo_file.read()
+                    caption = (
+                        f"🎁 **Reward Claim Proof for {res['email']}**\n"
+                        f"• Status: {res['reward'].get('status')}\n"
+                        f"• URL: {res['reward'].get('reward_url')}"
+                    )
+                    await _safe_send(lambda: update.message.reply_photo(photo=rw_photo_bytes, caption=caption))
                 except Exception as e:
-                    print(f"⚠️ Could not send reward screenshot proof: {e}")
+                    print(f"⚠️ Could not read or send reward screenshot proof: {e}")
             
     return ConversationHandler.END
 
@@ -711,14 +739,22 @@ def main():
             l.default_exception_handler(ctx)
         loop.set_exception_handler(_silent_win_error)
 
+    from telegram.request import HTTPXRequest
+    request = HTTPXRequest(
+        connection_pool_size=16,
+        read_timeout=60.0,
+        write_timeout=60.0,
+        connect_timeout=30.0,
+        pool_timeout=30.0,
+        media_write_timeout=60.0,
+        httpx_kwargs={"trust_env": True}
+    )
+
     application = (
         Application.builder()
         .token(token)
+        .request(request)
         .post_init(post_init)
-        .read_timeout(60)
-        .write_timeout(60)
-        .connect_timeout(60)
-        .pool_timeout(60)
         .build()
     )
 
@@ -752,7 +788,8 @@ def main():
             CommandHandler("stop", cancel),
             MessageHandler(filters.Regex(r"^🛑 Cancel / Reset$"), cancel)
         ],
-        allow_reentry=True
+        allow_reentry=True,
+        per_message=False
     )
 
     application.add_handler(conv_handler)
@@ -784,10 +821,30 @@ def main():
     httpd = HTTPServer(("0.0.0.0", port), HealthHandler)
     server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     server_thread.start()
-    print(f"🌐 Health server listening on port {port} for Render")
+
+    import time
+    _last_net_warn_time = 0.0
+
+    async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        nonlocal _last_net_warn_time
+        import telegram.error
+        if isinstance(context.error, (telegram.error.NetworkError, telegram.error.TimedOut)):
+            now = time.time()
+            if now - _last_net_warn_time > 60:
+                _last_net_warn_time = now
+                print(f"ℹ️ Telegram connection re-established automatically after transient network drop.")
+            return
+        print(f"⚠️ Unhandled error in Telegram bot: {context.error}")
+
+    application.add_error_handler(error_handler)
 
     print("🤖 Conversational Telegram Bot is running... Waiting for /start")
-    application.run_polling()
+    application.run_polling(
+        poll_interval=1.0,
+        timeout=20,
+        drop_pending_updates=True,
+        bootstrap_retries=-1
+    )
 
 if __name__ == "__main__":
     main()

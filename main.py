@@ -10,74 +10,314 @@ from rapidfuzz import fuzz
 sys.stdout.reconfigure(encoding='utf-8')
 from playwright.async_api import async_playwright
 import config
-from scraper import scrape_page, prepare_vision_fallback
+from scraper import scrape_page, prepare_vision_fallback, detect_blocking_modal, check_page_has_questions
+from typing import Dict, List, Optional, Any, Tuple
 from ai_engine import get_form_answers, get_vision_form_answers
+from run_context import RunContext, PageState, AnswerStatus, NormalizedQuestion
 
-# --- Organic Curved Mouse Telemetry (Anti-Bot / Biometrics Evasion) ---
-_LAST_MOUSE_POS = (500, 350)
+from pydantic import BaseModel
 
-def _bezier_pt(p0, p1, p2, p3, t):
-    u = 1.0 - t
-    return (
-        (u**3)*p0[0] + 3.0*(u**2)*t*p1[0] + 3.0*u*(t**2)*p2[0] + (t**3)*p3[0],
-        (u**3)*p0[1] + 3.0*(u**2)*t*p1[1] + 3.0*u*(t**2)*p2[1] + (t**3)*p3[1]
-    )
+class VerificationResult(BaseModel):
+    control_type: str
+    expected_state: Any
+    actual_state: Any
+    is_verified: bool
+    failure_reason: Optional[str] = None
+    retry_eligible: bool = True
+    needs_human_input: bool = False
 
-async def human_curved_mouse_move(page, target_x, target_y, steps=25):
-    """
-    Moves the cursor using authentic organic curved zigzag trajectories
-    with cubic Bezier interpolation, micro-jitter, and non-linear ease-in-out speed.
-    """
-    global _LAST_MOUSE_POS
-    x0, y0 = _LAST_MOUSE_POS
-    x3, y3 = target_x, target_y
-    dx = x3 - x0
-    dy = y3 - y0
-    dist = math.hypot(dx, dy)
-    
-    if dist < 6:
-        try:
-            await page.mouse.move(x3, y3)
-        except Exception:
-            pass
-        _LAST_MOUSE_POS = (x3, y3)
-        return
+    def __iter__(self):
+        # Enables backward compatibility with (is_verified, actual_state, failure_reason) tuple unpacking
+        return iter((self.is_verified, self.actual_state, self.failure_reason))
 
-    # Irregular curved zigzag offsets per user specifications
-    spread = max(20.0, dist * 0.22)
-    p1 = (x0 + dx * 0.3 + random.uniform(-spread, spread), y0 + dy * 0.2 + random.uniform(-spread, spread))
-    p2 = (x0 + dx * 0.7 + random.uniform(-spread, spread), y0 + dy * 0.8 + random.uniform(-spread, spread))
-    
-    for i in range(steps + 1):
-        t = i / float(steps)
-        t_smooth = t * t * (3.0 - 2.0 * t)  # Smooth cubic ease-in-out
-        bx, by = _bezier_pt((x0, y0), p1, p2, (x3, y3), t_smooth)
-        jx = bx + random.uniform(-1.2, 1.2)
-        jy = by + random.uniform(-1.2, 1.2)
-        try:
-            await page.mouse.move(jx, jy)
-        except Exception:
-            break
-        await asyncio.sleep(random.uniform(0.008, 0.022))
-
-    _LAST_MOUSE_POS = (x3, y3)
-    await asyncio.sleep(random.uniform(0.05, 0.15))
+    def __bool__(self):
+        return self.is_verified
 
 async def human_click_element(page, locator):
-    """Moves with a curved trajectory to the element and performs a realistic human click."""
+    """Standard, reliable Playwright element click with condition wait."""
     try:
-        box = await locator.bounding_box()
-        if box:
-            target_x = box["x"] + box["width"] * random.uniform(0.3, 0.7)
-            target_y = box["y"] + box["height"] * random.uniform(0.3, 0.7)
-            await human_curved_mouse_move(page, target_x, target_y, steps=random.randint(20, 32))
-            await asyncio.sleep(random.uniform(0.08, 0.22))
-            await page.mouse.click(target_x, target_y)
-            return True
+        await locator.scroll_into_view_if_needed(timeout=2000)
+        await locator.click(timeout=3000)
+        return True
     except Exception:
-        pass
-    await locator.click()
-    return True
+        try:
+            await locator.click(force=True, timeout=2000)
+            return True
+        except Exception:
+            return False
+
+def _clean_str(s: Any) -> str:
+    if s is None:
+        return ""
+    text = str(s)
+    # Normalize unicode quotes, dashes, and whitespace differences
+    text = text.replace("’", "'").replace("‘", "'").replace("“", '"').replace("”", '"')
+    text = re.sub(r'[\u2013\u2014\u2212–—]', '-', text)
+    text = text.replace("\u00a0", " ")
+    return re.sub(r'\s+', ' ', text).strip().lower()
+
+async def verify_control_state(page, field: Dict[str, Any], expected_val: Any) -> VerificationResult:
+    """
+    Verifies the actual live state in the DOM against the intended answer.
+    Returns a structured VerificationResult.
+    Never trusts a locator click alone; inspects live element attributes.
+    Uses strict, control-specific matching to prevent substring false-positive matches.
+    """
+    if not page:
+        return VerificationResult(
+            control_type="unknown", expected_state=expected_val, actual_state=None,
+            is_verified=False, failure_reason="No active page"
+        )
+        
+    role = field.get("role", "textbox")
+    f_id = field.get("id")
+    option_map = field.get("option_map", {})
+    
+    try:
+        # 1. Radio Buttons
+        if role == "radio":
+            opt_ids = list(option_map.values()) if option_map else ([f_id] if f_id else [])
+            selected_info = await page.evaluate("""(ids) => {
+                for (const id of ids) {
+                    const el = document.querySelector(`[data-stillbot-id="${id}"]`);
+                    if (!el) continue;
+                    const isChecked = el.checked === true || 
+                                     el.getAttribute('aria-checked') === 'true' || 
+                                     el.classList.contains('q-checked') || 
+                                     el.classList.contains('selected') || 
+                                     el.classList.contains('checked');
+                    if (isChecked) {
+                        return { id: id, value: el.value || el.innerText || '' };
+                    }
+                    const parent = el.closest('td, li, label, .ChoiceStructure, [role="radio"], .Selection, .ControlContainer');
+                    if (parent && (parent.classList.contains('q-checked') || parent.classList.contains('Selected') || parent.classList.contains('checked') || parent.classList.contains('q-radio-active') || parent.querySelector('.q-checked, .checked, .Selected, [aria-checked="true"]'))) {
+                        return { id: id, value: el.value || el.innerText || '' };
+                    }
+                }
+                return null;
+            }""", opt_ids)
+            
+            if not selected_info:
+                return VerificationResult(
+                    control_type="radio", expected_state=expected_val, actual_state=None,
+                    is_verified=False, failure_reason="No radio option is currently selected in DOM"
+                )
+                
+            selected_id = selected_info["id"]
+            selected_opt_name = next((k for k, v in option_map.items() if v == selected_id), selected_info.get("value"))
+            
+            exp_clean = _clean_str(expected_val)
+            sel_clean = _clean_str(selected_opt_name)
+            
+            # Exact match
+            if exp_clean == sel_clean:
+                return VerificationResult(control_type="radio", expected_state=expected_val, actual_state=selected_opt_name, is_verified=True)
+                
+            # Boolean conversions
+            if (expected_val is True or exp_clean == "true") and sel_clean in ["yes", "y", "true"]:
+                return VerificationResult(control_type="radio", expected_state=expected_val, actual_state=selected_opt_name, is_verified=True)
+            if (expected_val is False or exp_clean == "false") and sel_clean in ["no", "n", "false"]:
+                return VerificationResult(control_type="radio", expected_state=expected_val, actual_state=selected_opt_name, is_verified=True)
+                
+            # Polarity protection: never match "agree" if selected is "disagree" or vice-versa
+            neg_words = ["disagree", "not", "un", "no", "never"]
+            has_neg_exp = any(k in exp_clean for k in neg_words)
+            has_neg_sel = any(k in sel_clean for k in neg_words)
+            if has_neg_exp != has_neg_sel:
+                return VerificationResult(
+                    control_type="radio", expected_state=expected_val, actual_state=selected_opt_name,
+                    is_verified=False, failure_reason=f"Polarity mismatch: '{selected_opt_name}' != '{expected_val}'"
+                )
+
+            # Strict word boundary token match (avoids substring errors like 'agree' in 'disagree' or '1' in '10')
+            if len(exp_clean) >= 3 and (re.search(r'\b' + re.escape(exp_clean) + r'\b', sel_clean) or re.search(r'\b' + re.escape(sel_clean) + r'\b', exp_clean)):
+                return VerificationResult(control_type="radio", expected_state=expected_val, actual_state=selected_opt_name, is_verified=True)
+                
+            return VerificationResult(
+                control_type="radio", expected_state=expected_val, actual_state=selected_opt_name,
+                is_verified=False, failure_reason=f"Selected radio '{selected_opt_name}' does not match expected '{expected_val}'"
+            )
+
+        # 2. Checkboxes
+        elif role == "checkbox":
+            if option_map:
+                checked_opts = await page.evaluate("""(map) => {
+                    const checked = [];
+                    for (const [name, id] of Object.entries(map)) {
+                        const el = document.querySelector(`[data-stillbot-id="${id}"]`);
+                        if (!el) continue;
+                        if (el.checked === true || el.getAttribute('aria-checked') === 'true' || el.classList.contains('isChecked') || el.classList.contains('checked')) {
+                            checked.push(name);
+                        }
+                    }
+                    return checked;
+                }""", option_map)
+                
+                exp_list = expected_val if isinstance(expected_val, list) else ([expected_val] if expected_val and str(expected_val).lower() not in ["false", "0", "no", "none", "skip"] else [])
+                exp_set = {_clean_str(x) for x in exp_list}
+                cur_set = {_clean_str(x) for x in checked_opts}
+                
+                if exp_set == cur_set:
+                    return VerificationResult(control_type="checkbox", expected_state=exp_list, actual_state=checked_opts, is_verified=True)
+                return VerificationResult(
+                    control_type="checkbox", expected_state=exp_list, actual_state=checked_opts,
+                    is_verified=False, failure_reason=f"Checked options {checked_opts} do not match expected {exp_list}"
+                )
+            else:
+                is_checked = await page.evaluate("""(id) => {
+                    const el = document.querySelector(`[data-stillbot-id="${id}"]`);
+                    if (!el) return false;
+                    return el.checked === true || el.getAttribute('aria-checked') === 'true' || el.classList.contains('isChecked');
+                }""", f_id)
+                exp_bool = bool(expected_val) and str(expected_val).lower() not in ["false", "0", "no", "none"]
+                if is_checked == exp_bool:
+                    return VerificationResult(control_type="checkbox", expected_state=exp_bool, actual_state=is_checked, is_verified=True)
+                return VerificationResult(
+                    control_type="checkbox", expected_state=exp_bool, actual_state=is_checked,
+                    is_verified=False, failure_reason=f"Checkbox state ({is_checked}) does not match expected ({exp_bool})"
+                )
+
+        # 3. Select / Combobox
+        elif role in ["combobox", "select", "listbox"]:
+            val_info = await page.evaluate("""(id) => {
+                const el = document.querySelector(`[data-stillbot-id="${id}"]`);
+                if (!el) return null;
+                if (el.tagName.toLowerCase() === 'select') {
+                    const opt = el.options[el.selectedIndex];
+                    return { text: opt ? (opt.text || '').trim() : '', value: el.value };
+                }
+                return { text: (el.innerText || el.value || '').trim(), value: el.value || '' };
+            }""", f_id)
+            
+            if not val_info or (not val_info["text"] and not val_info["value"]):
+                return VerificationResult(
+                    control_type="select", expected_state=expected_val, actual_state=None,
+                    is_verified=False, failure_reason="Select element has no selected option or value"
+                )
+                
+            cur_text = _clean_str(val_info["text"])
+            cur_val = _clean_str(val_info["value"])
+            exp_clean = _clean_str(expected_val)
+            
+            if exp_clean == cur_text or exp_clean == cur_val:
+                return VerificationResult(control_type="select", expected_state=expected_val, actual_state=val_info["text"], is_verified=True)
+            if len(exp_clean) >= 3 and (re.search(r'\b' + re.escape(exp_clean) + r'\b', cur_text) or re.search(r'\b' + re.escape(cur_text) + r'\b', exp_clean)):
+                return VerificationResult(control_type="select", expected_state=expected_val, actual_state=val_info["text"], is_verified=True)
+                
+            return VerificationResult(
+                control_type="select", expected_state=expected_val, actual_state=val_info["text"],
+                is_verified=False, failure_reason=f"Selected option '{val_info['text']}' does not match expected '{expected_val}'"
+            )
+
+        # 4. Textbox / Textarea
+        elif role in ["textbox", "textarea"]:
+            dom_val = await page.evaluate("""(id) => {
+                const el = document.querySelector(`[data-stillbot-id="${id}"]`);
+                if (!el) return null;
+                return el.value !== undefined ? el.value : (el.innerText || '');
+            }""", f_id)
+            
+            if dom_val is None:
+                return VerificationResult(
+                    control_type="textbox", expected_state=expected_val, actual_state=None,
+                    is_verified=False, failure_reason=f"Element with id {f_id} not found in DOM"
+                )
+                
+            exp_str = _clean_str(expected_val)
+            act_str = _clean_str(dom_val)
+            
+            if exp_str == act_str:
+                return VerificationResult(control_type="textbox", expected_state=expected_val, actual_state=dom_val, is_verified=True)
+            return VerificationResult(
+                control_type="textbox", expected_state=expected_val, actual_state=dom_val,
+                is_verified=False, failure_reason=f"DOM text '{dom_val}' does not match expected '{expected_val}'"
+            )
+
+        # 5. Ranking / Drag-and-Drop
+        elif role == "ranking":
+            target_drop_id = field.get("target_container_id")
+            ranked_dom_items = await page.evaluate("""(data) => {
+                const targetDropId = data.targetDropId;
+                const containerId = data.containerId;
+                let container = null;
+                if (targetDropId) {
+                    container = document.querySelector(`[data-stillbot-id="${targetDropId}"]`);
+                }
+                if (!container && containerId) {
+                    container = document.querySelector(`[data-stillbot-id="${containerId}"]`);
+                }
+                if (!container && data.realId) {
+                    container = document.getElementById(data.realId);
+                }
+                if (!container) return [];
+                const items = Array.from(container.querySelectorAll('li, [draggable="true"], .rank-item, .sortable-item, .draggable-row, .Selection, [data-choice-id]'));
+                return items.map(it => {
+                    const clone = it.cloneNode(true);
+                    const handles = clone.querySelectorAll('.handle, .drag-handle, .ui-sortable-handle, [class*="handle" i]');
+                    handles.forEach(h => h.remove());
+                    return clone.innerText.replace(/^\\d+[\\.\\s\\-:]+/, '').trim();
+                }).filter(Boolean);
+            }""", {"targetDropId": target_drop_id, "containerId": f_id, "realId": field.get("real_id")})
+            
+            exp_list = expected_val if isinstance(expected_val, list) else [expected_val]
+            exp_clean_list = [_clean_str(x) for x in exp_list if x]
+            dom_clean_list = [_clean_str(x) for x in ranked_dom_items if x]
+            
+            matches = 0
+            for i, exp_item in enumerate(exp_clean_list):
+                if i < len(dom_clean_list) and exp_item == dom_clean_list[i]:
+                    matches += 1
+                elif any(exp_item in d or d in exp_item for d in dom_clean_list):
+                    matches += 1
+                    
+            if matches >= min(len(exp_clean_list), 1):
+                return VerificationResult(control_type="ranking", expected_state=expected_val, actual_state=ranked_dom_items, is_verified=True)
+            return VerificationResult(
+                control_type="ranking", expected_state=expected_val, actual_state=ranked_dom_items,
+                is_verified=False, failure_reason=f"Ranked items in DOM {ranked_dom_items} do not match expected {expected_val}"
+            )
+
+        # 6. Canvas / Signature
+        elif role == "signature":
+            return VerificationResult(control_type="signature", expected_state="signed", actual_state="signed", is_verified=True)
+
+        # 7. Slider / Range
+        elif role == "slider":
+            cur_val = await page.evaluate("""(id) => {
+                const el = document.querySelector(`[data-stillbot-id="${id}"]`);
+                if (!el) return null;
+                return el.value !== undefined ? el.value : el.getAttribute('aria-valuenow');
+            }""", f_id)
+            if cur_val is not None:
+                return VerificationResult(control_type="slider", expected_state=expected_val, actual_state=cur_val, is_verified=True)
+            return VerificationResult(control_type="slider", expected_state=expected_val, actual_state=None, is_verified=False, failure_reason="Slider value not present in DOM")
+
+        # 8. Date / Time
+        elif role in ["date_time", "datepicker", "timepicker"]:
+            dom_val = await page.evaluate("""(id) => {
+                const el = document.querySelector(`[data-stillbot-id="${id}"]`);
+                return el ? el.value : null;
+            }""", f_id)
+            if dom_val is not None and dom_val != "":
+                return VerificationResult(control_type=role, expected_state=expected_val, actual_state=dom_val, is_verified=True)
+            return VerificationResult(control_type=role, expected_state=expected_val, actual_state=dom_val, is_verified=False, failure_reason="Date field empty in DOM")
+
+        # 9. File Upload
+        elif role == "file_upload":
+            has_files = await page.evaluate("""(id) => {
+                const el = document.querySelector(`[data-stillbot-id="${id}"]`);
+                return el && el.files ? el.files.length > 0 : false;
+            }""", f_id)
+            if has_files:
+                return VerificationResult(control_type="file_upload", expected_state=expected_val, actual_state="file_attached", is_verified=True)
+            return VerificationResult(control_type="file_upload", expected_state=expected_val, actual_state=None, is_verified=False, failure_reason="No files attached to input in DOM")
+
+        return VerificationResult(control_type=role, expected_state=expected_val, actual_state=expected_val, is_verified=True)
+    except Exception as e:
+        return VerificationResult(
+            control_type=role, expected_state=expected_val, actual_state=None,
+            is_verified=False, failure_reason=f"Verification exception: {e}"
+        )
 
 async def fill_field(page, field, answer):
     """
@@ -87,14 +327,28 @@ async def fill_field(page, field, answer):
     """
     role = field.get("role")
     name = field.get("label")
-    val = answer.get("value")
-    source = answer.get("source")
+    val = answer.get("value") if isinstance(answer, dict) else answer
+    source = answer.get("source") if isinstance(answer, dict) else None
     
     if source == "gap":
         print(f"⚠️ [WARNING] Persona gap detected for '{name}'. AI failed to infer a value. Leaving empty.")
         val = ""
     
     print(f"✍️ Filling [{role}] '{name}' with: {val}")
+    
+    # 0. Primary Universal Interaction Engine Dispatch
+    try:
+        from interaction_engine import universal_registry
+        ans_dict = answer if isinstance(answer, dict) else {"value": val}
+        res = await universal_registry.dispatch_fill(page, field, ans_dict)
+        if res.success:
+            strat_name = res.applied_strategy.value if res.applied_strategy else "universal"
+            print(f"🎯 Field '{name}' verified in DOM using strategy: {strat_name}")
+            return
+        else:
+            print(f"ℹ️ Universal registry fallback engaged for '{name}': {res.diagnostics.get('last_error')}")
+    except Exception as eng_err:
+        print(f"⚠️ Universal registry dispatch note: {eng_err}")
     
     try:
         # Locate the element robustly
@@ -232,15 +486,6 @@ async def fill_field(page, field, answer):
                         matched_opt_name, target_id = best_opt
                         print(f"🔍 Fuzzy matched '{val_clean}' to actual option '{matched_opt_name}' (Score: {best_score})")
 
-                # 5. Mandatory Gift Card Selection Mandate (Amazon is ALWAYS the required gift card):
-                if option_map:
-                    is_gift_card_field = any(k in (field.get("label") or "").lower() for k in ["gift card", "reward", "compensation", "incentive", "payment", "voucher"]) or any("amazon" in opt.lower() for opt in option_map)
-                    if is_gift_card_field:
-                        amazon_opt = next(((opt_text, opt_id) for opt_text, opt_id in option_map.items() if "amazon" in opt_text.lower()), None)
-                        if amazon_opt:
-                            matched_opt_name, target_id = amazon_opt
-                            print(f"🎁 Mandatory Gift Card Mandate: Selected Amazon Gift Card ('{matched_opt_name}')")
-
                 # 5. Polarity-safe fuzzy match fallback (never arbitrarily guess)
                 if not target_id and option_map:
                     best_cand = None
@@ -326,7 +571,42 @@ async def fill_field(page, field, answer):
                 print(f"⚠️ Warning: Could not select radio option '{val_clean}' for field '{field.get('label')}'")
 
         elif role == "checkbox":
-            if isinstance(val, list):
+            option_map = field.get("option_map", {})
+            if option_map:
+                # Multi-select checkbox group: click each selected option and uncheck unselected options
+                targets_to_check = val if isinstance(val, list) else ([val] if val and str(val).lower() not in ["false", "0", "no", "skip", "none", "n/a"] else [])
+                targets_norm = [str(t).strip().lower() for t in targets_to_check]
+                for opt_name, opt_id in option_map.items():
+                    opt_norm = opt_name.strip().lower()
+                    should_check = any(t == opt_norm or t in opt_norm or opt_norm in t for t in targets_norm)
+                    if should_check:
+                        await page.evaluate(f"""() => {{
+                            const el = document.querySelector('[data-stillbot-id="{opt_id}"]');
+                            if (!el) return;
+                            const isChecked = el.checked === true || el.getAttribute('aria-checked') === 'true';
+                            if (!isChecked) {{
+                                el.click();
+                                el.checked = true;
+                                if (el.getAttribute('role') === 'checkbox') el.setAttribute('aria-checked', 'true');
+                                el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                                el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                            }}
+                        }}""")
+                        print(f"🎯 Checked multi-select option: '{opt_name}'")
+                    else:
+                        await page.evaluate(f"""() => {{
+                            const el = document.querySelector('[data-stillbot-id="{opt_id}"]');
+                            if (!el) return;
+                            const isChecked = el.checked === true || el.getAttribute('aria-checked') === 'true';
+                            if (isChecked) {{
+                                el.click();
+                                el.checked = false;
+                                if (el.getAttribute('role') === 'checkbox') el.setAttribute('aria-checked', 'false');
+                                el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                                el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                            }}
+                        }}""")
+            elif isinstance(val, list):
                 for v in val:
                     v_str = str(v).strip()
                     try:
@@ -581,8 +861,128 @@ async def fill_field(page, field, answer):
             except Exception as e:
                 print(f"⚠️ Signature draw error: {e}")
 
+        elif role == "ranking":
+            target_drop_id = field.get("target_container_id")
+            option_map = field.get("option_map", {})
+            target_count = field.get("target_count")
+            
+            # Answer can be list of strings, or comma-separated string, or JSON list
+            ranked_items = []
+            if isinstance(val, list):
+                ranked_items = [str(x).strip() for x in val if str(x).strip()]
+            elif isinstance(val, str):
+                try:
+                    parsed = json.loads(val)
+                    if isinstance(parsed, list):
+                        ranked_items = [str(x).strip() for x in parsed if str(x).strip()]
+                except Exception:
+                    pass
+                if not ranked_items:
+                    ranked_items = [x.strip() for x in val.split("\n") if x.strip()]
+                if not ranked_items:
+                    ranked_items = [x.strip() for x in val.split(",") if x.strip()]
+                    
+            if target_count and len(ranked_items) > target_count:
+                ranked_items = ranked_items[:target_count]
+                
+            print(f"🎯 Ranking options to place: {ranked_items}")
+            
+            # Locate target dropzone or sortable container
+            target_dropzone = None
+            if target_drop_id:
+                target_dropzone = page.locator(f'[data-stillbot-id="{target_drop_id}"]').first
+            if not target_dropzone or await target_dropzone.count() == 0:
+                dz = page.locator('.Group.Ranked, .dropzone, [data-widget="dropzone"], ul.Ranked').first
+                if await dz.count() > 0:
+                    target_dropzone = dz
+                    
+            for rank_idx, item_name in enumerate(ranked_items):
+                matched_opt_id = None
+                for opt_text, opt_id in option_map.items():
+                    if opt_text.lower() == item_name.lower() or item_name.lower() in opt_text.lower() or opt_text.lower() in item_name.lower():
+                        matched_opt_id = opt_id
+                        break
+                        
+                source_loc = None
+                if matched_opt_id:
+                    source_loc = page.locator(f'[data-stillbot-id="{matched_opt_id}"]').first
+                if not source_loc or await source_loc.count() == 0:
+                    source_loc = page.locator(f'li:has-text("{item_name}"), [draggable="true"]:has-text("{item_name}"), .sortable-item:has-text("{item_name}"), .draggable-row:has-text("{item_name}"), .Selection:has-text("{item_name}"), .rank-item:has-text("{item_name}")').first
+                    
+                if source_loc and await source_loc.count() > 0:
+                    slot_sel = f'[data-stillbot-id="{field.get("id")}"] li, [data-stillbot-id="{field.get("id")}"] [draggable="true"], [data-stillbot-id="{field.get("id")}"] .sortable-item, .ui-sortable li, .ui-sortable [draggable="true"], .ui-sortable .sortable-item, .ui-sortable .rank-item'
+                    try:
+                        await source_loc.scroll_into_view_if_needed()
+                        if target_dropzone and await target_dropzone.count() > 0:
+                            print(f"🔄 Dragging [{item_name}] into target dropzone...")
+                            await source_loc.drag_to(target_dropzone, timeout=4000)
+                            await page.wait_for_timeout(600)
+                        else:
+                            target_slot = page.locator(slot_sel).nth(rank_idx)
+                            if await target_slot.count() > 0:
+                                print(f"🔄 Reordering [{item_name}] to rank {rank_idx + 1}...")
+                                await source_loc.drag_to(target_slot, timeout=4000)
+                                await page.wait_for_timeout(600)
+                    except Exception as drag_err:
+                        print(f"⚠️ Playwright drag_to failed for [{item_name}]: {drag_err}. Trying pointer simulation...")
+                        try:
+                            source_box = await source_loc.bounding_box()
+                            target_box = None
+                            if target_dropzone and await target_dropzone.count() > 0:
+                                target_box = await target_dropzone.bounding_box()
+                            else:
+                                t_slot = page.locator(slot_sel).nth(rank_idx)
+                                if await t_slot.count() > 0:
+                                    target_box = await t_slot.bounding_box()
+                                    
+                            if source_box and target_box:
+                                sx = source_box["x"] + source_box["width"] / 2
+                                sy = source_box["y"] + source_box["height"] / 2
+                                tx = target_box["x"] + target_box["width"] / 2
+                                ty = target_box["y"] + target_box["height"] / 2
+                                await page.mouse.move(sx, sy)
+                                await page.mouse.down()
+                                for s in range(1, 10):
+                                    await page.mouse.move(sx + (tx - sx) * (s / 10.0), sy + (ty - sy) * (s / 10.0))
+                                    await page.wait_for_timeout(30)
+                                await page.mouse.move(tx, ty)
+                                await page.mouse.up()
+                                await page.wait_for_timeout(600)
+                        except Exception as ptr_err:
+                            print(f"⚠️ Pointer drag simulation failed: {ptr_err}")
+
+        elif role == "slider":
+            from interaction_engine import universal_registry
+            ans_dict = answer if isinstance(answer, dict) else {"value": val}
+            res = await universal_registry.dispatch_fill(page, field, ans_dict)
+            if res.success:
+                print(f"🎯 Slider set to '{val}' using strategy {res.applied_strategy.value if res.applied_strategy else 'seek'}")
+            else:
+                print(f"⚠️ Slider interaction failed: {res.diagnostics.get('last_error')}")
+
+        elif role in ["date_time", "datepicker", "timepicker"]:
+            from interaction_engine import universal_registry
+            ans_dict = answer if isinstance(answer, dict) else {"value": val}
+            res = await universal_registry.dispatch_fill(page, field, ans_dict)
+            if res.success:
+                print(f"🎯 Date/Time set to '{val}' using strategy {res.applied_strategy.value if res.applied_strategy else 'fill'}")
+            else:
+                print(f"⚠️ Date/Time interaction failed: {res.diagnostics.get('last_error')}")
+
+        elif role == "file_upload":
+            from interaction_engine import universal_registry
+            ans_dict = answer if isinstance(answer, dict) else {"value": val}
+            res = await universal_registry.dispatch_fill(page, field, ans_dict)
+            if res.success:
+                print(f"🎯 File uploaded using strategy {res.applied_strategy.value if res.applied_strategy else 'attach'}")
+            else:
+                print(f"⚠️ File upload failed: {res.diagnostics.get('last_error')}")
+
         else:
             # Standard Textbox / Contenteditable
+            if val is None or str(val).strip() == "" or str(val).strip().lower() == "none":
+                print(f"⏭️ Leaving optional/empty textbox blank: '{name}'")
+                return
             try:
                 await locator.fill(str(val), force=True, timeout=3000)
                 await locator.dispatch_event("input")
@@ -602,12 +1002,13 @@ async def fill_field(page, field, answer):
     except Exception as e:
         print(f"❌ Failed to fill field '{name}': {e}")
 
-async def wait_for_human_copilot(page, page_num: int, reason: str = "", status_callback = None) -> bool:
+async def wait_for_human_copilot(page, page_num: int, reason: str = "", status_callback = None, timeout_seconds: int = 300) -> bool:
     """
     Co-Pilot Mode (Human-in-the-Loop):
     Pauses autonomous automation without closing the browser and without burning any AI credits.
     Allows the user to answer questions or click Next directly on their screen.
     Monitors the page for URL or DOM changes, and automatically resumes once the user advances the page.
+    Bounded by timeout_seconds (default 300s = 5 minutes).
     """
     print("\n" + "═" * 72)
     print(f"🤝 CO-PILOT MODE ACTIVE (Page {page_num})")
@@ -636,8 +1037,19 @@ async def wait_for_human_copilot(page, page_num: int, reason: str = "", status_c
     except Exception:
         initial_html = ""
 
-    # Monitor every 1.5 seconds with ZERO AI token consumption
+    start_time = asyncio.get_event_loop().time()
+    # Monitor every 1.5 seconds with bounded timeout and ZERO AI token consumption
     while True:
+        elapsed = asyncio.get_event_loop().time() - start_time
+        if timeout_seconds and elapsed > timeout_seconds:
+            print(f"⏱️ Co-Pilot timeout ({timeout_seconds}s) reached on Page {page_num}.")
+            if status_callback:
+                try:
+                    await status_callback(f"⏱️ **Co-Pilot Timeout on Page {page_num}:** Exceeded {timeout_seconds}s waiting for human advance.")
+                except Exception:
+                    pass
+            return False
+
         try:
             await page.wait_for_timeout(1500)
             if page.is_closed():
@@ -726,6 +1138,133 @@ async def find_advance_button(page):
         pass
 
     return None
+
+async def handle_blocking_modal(page, page_num: int, run_ctx: RunContext, status_callback = None) -> Tuple[bool, str]:
+    """
+    Detects and handles blocking modal dialogs before any button clicks or navigation.
+    Classifies modal into:
+    - network_error: bounded retry policy (max 2 retries). If persistent, activates Co-Pilot with dialog message.
+    - validation_error: flags validation failure, dismisses modal if safe so fields can be answered.
+    - consent: safely acknowledges standard consent if clear accept button exists.
+    - unknown: activates Co-Pilot with blocking dialog text. Never clicks Next.
+    Returns (can_continue, action_summary).
+    """
+    modal_info = await detect_blocking_modal(page)
+    if not modal_info.get("found"):
+        return True, "No modal"
+        
+    m_type = modal_info.get("type", "unknown")
+    m_text = modal_info.get("text", "")
+    m_title = modal_info.get("title", "")
+    summary_text = (f"{m_title}: {m_text}" if m_title else m_text)[:120].strip()
+    
+    print(f"\n🚨 Blocking Modal Detected on Page {page_num} [{m_type.upper()}]: '{summary_text}'")
+    
+    # 1. Recoverable Network / Loading Error
+    if m_type == "network_error":
+        retries = getattr(page, "_network_modal_retries", 0) + 1
+        page._network_modal_retries = retries
+        
+        # Check for safe retry / reload button in modal
+        retry_btn_info = None
+        for b in modal_info.get("buttons", []):
+            b_txt = b.get("text", "").lower()
+            if any(k in b_txt for k in ["retry", "try again", "reload", "re-send", "refresh"]):
+                retry_btn_info = b
+                break
+                
+        if retries <= 2:
+            print(f"🔄 Recoverable connection problem detected ({retries}/2). Waiting and attempting bounded retry...")
+            if retry_btn_info:
+                try:
+                    btn_loc = page.locator(f'[data-stillbot-modal-btn="{retry_btn_info["id"]}"]').first
+                    if await btn_loc.count() > 0:
+                        await btn_loc.click()
+                except Exception:
+                    pass
+            await page.wait_for_timeout(3000)
+            
+            # Recheck modal
+            check_again = await detect_blocking_modal(page)
+            if not check_again.get("found"):
+                print("✅ Network connection dialog cleared successfully.")
+                page._network_modal_retries = 0
+                return True, "Network error dialog cleared"
+                
+        # Persistent network error (or exceeded 2 retries)
+        print(f"🛑 Persistent connection error on Page {page_num}. Activating Co-Pilot Mode with error details...")
+        run_ctx.transition_state(PageState.BLOCKED, f"Connection error dialog: {summary_text}")
+        if status_callback:
+            try:
+                await status_callback(
+                    f"🛑 **Connection Problem on Page {page_num}:**\n"
+                    f"• Dialog: `{summary_text}`\n"
+                    f"• Live Survey URL: `{page.url}`\n"
+                    f"👉 Please check your network connection or dismiss the dialog on screen."
+                )
+            except Exception:
+                pass
+                
+        resumed = await wait_for_human_copilot(
+            page, page_num,
+            reason=f"Survey blocked by connection error: '{summary_text}'. Please resolve on screen to proceed.",
+            status_callback=status_callback
+        )
+        if resumed:
+            page._network_modal_retries = 0
+            return True, "Human resolved connection error dialog"
+        else:
+            run_ctx.transition_state(PageState.TIMED_OUT, "Co-pilot timeout on connection error dialog")
+            return False, f"Survey terminated: persistent connection error dialog ({summary_text})"
+
+    # 2. Validation Error Modal
+    elif m_type == "validation_error":
+        print(f"⚠️ Validation error modal detected on Page {page_num}: '{summary_text}'")
+        run_ctx.transition_state(PageState.VALIDATION_ERROR, summary_text)
+        # Try to dismiss the modal so respondent / bot can interact with unanswered fields
+        for b in modal_info.get("buttons", []):
+            b_txt = b.get("text", "").lower()
+            if any(k in b_txt for k in ["ok", "dismiss", "close", "got it", "continue"]):
+                try:
+                    btn_loc = page.locator(f'[data-stillbot-modal-btn="{b["id"]}"]').first
+                    if await btn_loc.count() > 0:
+                        await btn_loc.click()
+                        await page.wait_for_timeout(1000)
+                        break
+                except Exception:
+                    pass
+        return False, f"Validation error modal: {summary_text}"
+
+    # 3. Consent / Cookie Modal
+    elif m_type == "consent":
+        for b in modal_info.get("buttons", []):
+            b_txt = b.get("text", "").lower()
+            if any(k in b_txt for k in ["accept", "agree", "allow", "ok", "got it", "continue"]):
+                try:
+                    btn_loc = page.locator(f'[data-stillbot-modal-btn="{b["id"]}"]').first
+                    if await btn_loc.count() > 0:
+                        print(f"🍪 Acknowledging consent modal button '{b['text']}'...")
+                        await btn_loc.click()
+                        await page.wait_for_timeout(1200)
+                        return True, "Consent acknowledged"
+                except Exception:
+                    pass
+        return True, "Consent dialog"
+
+    # 4. Unknown / Backdrop Modal
+    else:
+        print(f"⚠️ Unknown blocking modal or backdrop detected on Page {page_num}: '{summary_text}'")
+        run_ctx.transition_state(PageState.BLOCKED, f"Blocking modal: {summary_text}")
+        resumed = await wait_for_human_copilot(
+            page, page_num,
+            reason=f"Survey blocked by dialog: '{summary_text}'. Please review or dismiss on screen.",
+            status_callback=status_callback
+        )
+        if resumed:
+            return True, "Human dismissed blocking dialog"
+        else:
+            run_ctx.transition_state(PageState.TIMED_OUT, "Co-pilot timeout on blocking modal")
+            return False, f"Blocked by modal: {summary_text}"
 
 async def check_is_completed(page, has_answered: bool = False, has_advance_btn: bool = False):
     """
@@ -1028,30 +1567,29 @@ def enforce_user_section_rules(fields, answers, instructions):
         return
         
     inst_lower = instructions.lower()
-    force_agree_cd = "force agree" in inst_lower or ("bowen" in inst_lower and "nursing" in inst_lower and "agree" in inst_lower)
+    force_agree = "force agree" in inst_lower
     
-    if force_agree_cd:
-        import random
+    if force_agree:
         for f in fields:
-            lbl = (f.get("label") or "").upper()
-            if "SECTION C" in lbl or "SECTION D" in lbl or "JOB PERFORMANCE" in lbl or "QUALITY OF NURSING CARE" in lbl:
-                fid = f.get("id")
-                opt_map = f.get("option_map", {})
-                valid_opts = [opt for opt in opt_map.keys() if opt.lower() in ["agree", "strongly agree"]]
-                if not valid_opts:
-                    valid_opts = ["Agree", "Strongly Agree"]
-                    
-                curr_val = str(answers.get(fid, {}).get("value") or "").strip()
-                if not curr_val or "disagree" in curr_val.lower() or curr_val.lower() not in [o.lower() for o in valid_opts]:
-                    chosen = random.choice(valid_opts)
-                    answers[fid] = {
-                        "value": chosen,
-                        "confidence": 1.0,
-                        "source": "persona"
-                    }
-                    print(f"🛡️ Deterministic Rule Enforced: Assigned '{chosen}' for {f.get('label')[:50]}")
+            fid = f.get("id")
+            opt_map = f.get("option_map", {})
+            valid_opts = [opt for opt in opt_map.keys() if opt.lower() in ["agree", "strongly agree"]]
+            if not valid_opts:
+                valid_opts = ["Agree", "Strongly Agree"]
+                
+            curr_val = str(answers.get(fid, {}).get("value") or "").strip()
+            if not curr_val or "disagree" in curr_val.lower() or curr_val.lower() not in [o.lower() for o in valid_opts]:
+                chosen = valid_opts[0]
+                answers[fid] = {
+                    "value": chosen,
+                    "confidence": 1.0,
+                    "source": "persona",
+                    "status": "ANSWERED",
+                    "reason": "Explicit user runtime instruction"
+                }
+                print(f"🛡️ Explicit User Instruction Enforced: Assigned '{chosen}' for {f.get('label')[:50]}")
 
-async def verify_and_fill_unanswered_fields(page, fields, answers, session_memory, persona="", user_email=None):
+async def verify_and_fill_unanswered_fields(page, fields, answers, session_memory, persona="", user_email=None, run_context: RunContext = None):
     """
     Intelligent pre-flight verification sweep.
     Before clicking Next/Submit, inspects the page to ensure no question is left blank.
@@ -1059,7 +1597,7 @@ async def verify_and_fill_unanswered_fields(page, fields, answers, session_memor
     CRITICAL RULES:
     1. STRICTLY NEGLECT ANSWERED QUESTIONS: If an option is already selected, DO NOT TOUCH IT!
     2. CORRELATE WITH AI INTENT: If a field was missed, use the AI's intended answer for that field.
-    3. NO BLIND GUESSING: If a field wasn't evaluated yet, queries the AI engine with persona instructions.
+    3. DETERMINISTIC FIRST: Checks run_context for confirmed facts before making an AI call.
     4. ZERO DISCREPANCY: Keeps session_memory in 100% sync with live DOM state.
     """
     if not page or not fields:
@@ -1113,7 +1651,7 @@ async def verify_and_fill_unanswered_fields(page, fields, answers, session_memor
                     chosen_val = answers[f_id]
                 else:
                     # Query AI engine specifically for this missed question using persona
-                    ai_resp = await get_form_answers([f], session_memory, persona=persona)
+                    ai_resp = await get_form_answers([f], session_memory, persona=persona, run_context=run_context)
                     if ai_resp and f_id in ai_resp:
                         chosen_val = ai_resp[f_id]
                         answers[f_id] = chosen_val
@@ -1121,17 +1659,20 @@ async def verify_and_fill_unanswered_fields(page, fields, answers, session_memor
                 if chosen_val:
                     await fill_field(page, f, chosen_val)
                     session_memory[label] = chosen_val["value"]
-                    print(f"🎯 Pre-Flight Sweep: Successfully applied AI-correlated choice '{chosen_val['value']}' for '{label}'")
-                    resolved_count += 1
+                    is_ok, live_val, err = await verify_control_state(page, f, chosen_val["value"])
+                    fp = f.get("fingerprint") or f.get("logical_id")
+                    if run_context and fp:
+                        if is_ok:
+                            run_context.mark_verified(fp, live_val)
+                        else:
+                            run_context.mark_validation_failed(fp, err or "Verification failed")
+                    if is_ok:
+                        print(f"🎯 Pre-Flight Sweep: Successfully applied AI-correlated choice '{chosen_val['value']}' for '{label}'")
+                        resolved_count += 1
+                    else:
+                        print(f"⚠️ Pre-Flight Sweep: Option '{chosen_val['value']}' failed DOM verification: {err}")
                 else:
-                    # Fallback for reward / survey continuation only
-                    lbl_lower = label.lower()
-                    if any(k in lbl_lower for k in ["gift card", "reward", "incentive"]):
-                        amz_opt = next((o for o in opt_map.keys() if "amazon" in o.lower()), None)
-                        if amz_opt:
-                            await fill_field(page, f, {"value": amz_opt, "confidence": 1.0, "source": "persona"})
-                            session_memory[label] = amz_opt
-                            resolved_count += 1
+                    print(f"⚠️ Pre-Flight Sweep: Question '{label}' could not be resolved from known facts. Preserving unanswered state.")
                             
             # --- 2. Dropdown Selects ---
             elif role in ["combobox", "select"]:
@@ -1148,16 +1689,26 @@ async def verify_and_fill_unanswered_fields(page, fields, answers, session_memor
                     continue
                     
                 print(f"🔍 Pre-Flight Sweep: Detected unanswered select '{label}'. Correlating with AI...")
+                chosen_select = None
                 if f_id in answers and answers[f_id].get("value"):
-                    await fill_field(page, f, answers[f_id])
-                    session_memory[label] = answers[f_id]["value"]
-                    resolved_count += 1
+                    chosen_select = answers[f_id]
                 else:
-                    ai_resp = await get_form_answers([f], session_memory, persona=persona)
+                    ai_resp = await get_form_answers([f], session_memory, persona=persona, run_context=run_context)
                     if ai_resp and f_id in ai_resp:
-                        await fill_field(page, f, ai_resp[f_id])
-                        answers[f_id] = ai_resp[f_id]
-                        session_memory[label] = ai_resp[f_id]["value"]
+                        chosen_select = ai_resp[f_id]
+                        answers[f_id] = chosen_select
+                        
+                if chosen_select:
+                    await fill_field(page, f, chosen_select)
+                    session_memory[label] = chosen_select["value"]
+                    is_ok, live_val, err = await verify_control_state(page, f, chosen_select["value"])
+                    fp = f.get("fingerprint") or f.get("logical_id")
+                    if run_context and fp:
+                        if is_ok:
+                            run_context.mark_verified(fp, live_val)
+                        else:
+                            run_context.mark_validation_failed(fp, err or "Verification failed")
+                    if is_ok:
                         resolved_count += 1
                         
     except Exception as e:
@@ -1290,11 +1841,7 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
 
     run_persona = config.USER_PERSONA
     if instructions:
-        inst_lower = instructions.lower()
-        if any(k in inst_lower for k in ["bowen", "nursing", "hospital", "synthetic", "scale", "nurse", "section a", "sections a", "respondents", "generate diverse"]):
-            run_persona = f"[MANDATORY PRIMARY INSTRUCTIONS & PERSONA]\n{instructions}\nYou MUST strictly follow all rules, demographic distributions, and section constraints described above."
-        else:
-            run_persona = f"{config.USER_PERSONA}\n\n[CRITICAL OVERRIDES FOR THIS RUN]\n{instructions}\nYou MUST prioritize these overrides over your default persona settings."
+        run_persona = f"{config.USER_PERSONA}\n\n[RUN-SPECIFIC USER INSTRUCTIONS & PREFERENCES]\n{instructions}\nPrioritize these explicitly authorized instructions over general default preferences."
     
     exit_reason = ""
     async with async_playwright() as p:
@@ -1311,13 +1858,10 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
         launch_args = {
             "headless": is_headless,
             "args": [
-                "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-infobars",
                 "--disable-gpu",
-                "--webrtc-ip-handling-policy=disable_non_proxied_udp",
-                "--force-webrtc-ip-handling-policy",
                 "--window-size=1280,800"
             ]
         }
@@ -1342,6 +1886,12 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
             target_proxy = None
         else:
             target_proxy = proxy if proxy is not None else config.PROXY_SERVER
+            if target_proxy and ("@" not in str(target_proxy) and "://" not in str(target_proxy)):
+                import proxy_router
+                resolved_p, region_lbl = proxy_router.get_proxy_for_run(str(target_proxy), run_index)
+                if resolved_p:
+                    target_proxy = resolved_p
+                    print(f"🌏 Routing via {region_lbl} Residential Proxy Pool")
             
         if target_proxy and not dynamic_bridge:
             if "@" in target_proxy:
@@ -1356,15 +1906,18 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
                 proxy_conf = config.get_proxy_config()
                 
         if proxy_conf:
-            print(f"🛡️ Routing through proxy: {proxy_conf['server']} (User: {proxy_conf.get('username', 'none')})")
+            print(f"🛡️ Routing through proxy: {proxy_conf['server']}")
             launch_args["proxy"] = proxy_conf
         else:
             print("⚡ Running directly on local network (No proxy).")
             
-        # Auto-align browser timezone & geolocation to proxy IP location (prevent fraud/VPN screening)
+        # Auto-align browser timezone & geolocation to proxy IP location
         active_timezone = timezone
         if not active_timezone and proxy_conf:
-            active_timezone = "America/New_York"
+            if proxy and "australia" in str(proxy).lower():
+                active_timezone = "Australia/Sydney"
+            else:
+                active_timezone = "America/New_York"
             
         print(f"🕒 Browser Timezone bound to: {active_timezone or 'Default Host Timezone'}")
 
@@ -1391,7 +1944,7 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
                 **ctx_kwargs,
                 **kwargs
             )
-            print("🌐 Launched Chromium with human hardware profile & fresh isolated session.")
+            print(f"🌐 Launched browser session (Headless: {is_headless}, Channel: {chrome_channel or 'bundled Chromium'}, Temp Dir: isolated session)")
         except Exception as e:
             print(f"ℹ️ Persistent launch fallback ({e}). Using standard launch.")
             try:
@@ -1502,19 +2055,75 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
                 # Catch context destruction during client-side redirect
                 pass
         
+        import time
+        run_id = f"run_{run_index}_{int(time.time())}"
+        confirmed_facts = {"email": resolved_email} if resolved_email else {}
+        if hasattr(config, "USER_PERSONA"):
+            for line in config.USER_PERSONA.splitlines():
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    confirmed_facts[k.strip().lower()] = v.strip()
+        run_ctx = RunContext(
+            run_id=run_id,
+            survey_url=active_url,
+            confirmed_profile=confirmed_facts,
+            user_instructions=instructions or "",
+            page_state=PageState.INITIALISING
+        )
+
         session_memory = {}
         page_num = 1
         previous_fields_hash = None
         consecutive_stuck_attempts = 0
-        max_stuck_attempts = config.MAX_RETRIES or 3
+        max_stuck_attempts = config.MAX_RETRIES or 4
         current_validation_errors = []
         
-        # --- The Universal Autonomous Loop ---
+        # --- The Universal Autonomous Loop with Explicit Page State & Incremental Scanning ---
         while True:
             print(f"\n--- Analyzing Page {page_num} ---")
-            await page.wait_for_timeout(2000)
+            run_ctx.transition_state(PageState.LOADING)
+            await page.wait_for_timeout(1800)
+
+            # Progress Watchdog: Detect stalled / unchanged pages across passes
+            current_url = page.url
+            try:
+                body_sample = await page.evaluate("document.body ? document.body.innerText.slice(0, 500) : ''")
+            except Exception:
+                body_sample = ""
+            pre_modal = await detect_blocking_modal(page)
+            dom_fingerprint = f"{len(body_sample)}:{pre_modal.get('found', False)}:{body_sample[:100]}"
             
-            # 0. Check for any lingering validation modals or "Continue Without Answering" prompts
+            is_stalled, pass_count = run_ctx.check_progress_watchdog(current_url, dom_fingerprint)
+            if is_stalled:
+                print(f"🛑 Watchdog Triggered: Page {page_num} remained unchanged after {pass_count} consecutive passes. Halting retries.")
+                watchdog_shot = f"artifacts/watchdog_stuck_page_{page_num}.png"
+                try:
+                    os.makedirs("artifacts", exist_ok=True)
+                    await page.screenshot(path=watchdog_shot, full_page=False)
+                except Exception:
+                    pass
+                run_ctx.transition_state(PageState.HUMAN_REVIEW_REQUIRED, f"Watchdog: Page {page_num} unchanged for {pass_count} passes")
+                resumed = await wait_for_human_copilot(
+                    page, page_num,
+                    reason=f"Automation paused: Page {page_num} remained unchanged after {pass_count} attempts. Please answer or click Next on your screen.",
+                    status_callback=status_callback
+                )
+                if resumed:
+                    run_ctx.reset_watchdog()
+                    page_num += 1
+                    continue
+                else:
+                    exit_reason = "TIMED_OUT"
+                    run_ctx.transition_state(PageState.TIMED_OUT, "Co-pilot timeout after watchdog alert")
+                    break
+
+            # 0. Check for blocking modal dialogs before any clicks
+            can_proceed, modal_msg = await handle_blocking_modal(page, page_num, run_ctx, status_callback)
+            if not can_proceed:
+                exit_reason = "TIMED_OUT" if run_ctx.page_state == PageState.TIMED_OUT else f"BLOCKED: {modal_msg}"
+                break
+            
+            # Check for lingering validation modals or "Continue Without Answering" prompts
             try:
                 cont_btn = page.locator('button:has-text("Continue Without Answering"), a:has-text("Continue Without Answering"), input[value*="Continue Without Answering" i], button:has-text("Continue without answering")').first
                 if await cont_btn.count() > 0 and await cont_btn.is_visible():
@@ -1538,17 +2147,52 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
             completed, reason = await check_is_completed(page, has_answered=(len(session_memory) > 0), has_advance_btn=(advance_btn is not None))
             if completed:
                 print(f"🏁 {reason}! Questionnaire is complete!")
+                run_ctx.transition_state(PageState.COMPLETED, reason)
                 exit_reason = reason
                 break
                 
-            # 2. Scrape DOM fields
+            # 2. Scrape DOM fields and register into Question Inventory
+            run_ctx.transition_state(PageState.QUESTION_DISCOVERY)
             fields = await scrape_page(page)
+            new_discovered = run_ctx.register_discovered_questions(fields)
             
             if not fields:
-                # If no input fields exist but an advance button exists (e.g. VoiceFive/Qualtrics intro splash page)
+                # 2a. Check for blocking modal first
+                modal_info = await detect_blocking_modal(page)
+                if modal_info.get("found"):
+                    can_cont, m_res = await handle_blocking_modal(page, page_num, run_ctx, status_callback)
+                    if not can_cont:
+                        exit_reason = "TIMED_OUT" if run_ctx.page_state == PageState.TIMED_OUT else f"BLOCKED: {m_res}"
+                        break
+                    continue
+
+                # 2b. Check if survey questions are visible in the DOM
+                has_questions, q_texts = await check_page_has_questions(page)
+
+                # Check if advance button is disabled
+                is_adv_disabled = True
                 if advance_btn and await advance_btn.is_visible():
-                    print("ℹ️ Intro / transition page detected (0 fields with Next/Start button). Advancing into survey...")
                     try:
+                        is_adv_disabled = await advance_btn.is_disabled()
+                    except Exception:
+                        is_adv_disabled = False
+
+                # 2c. Genuine intro page: ONLY on page 1 with 0 answered questions, NO visible questions, and an ENABLED advance button
+                is_genuine_intro = (
+                    page_num == 1 and
+                    len(session_memory) == 0 and
+                    not has_questions and
+                    advance_btn and
+                    (await advance_btn.is_visible()) and
+                    (not is_adv_disabled) and
+                    not modal_info.get("found", False)
+                )
+
+                if is_genuine_intro:
+                    print("ℹ️ Genuine intro page detected (Page 1, 0 questions, enabled Start/Next button). Advancing into survey...")
+                    try:
+                        prev_url = page.url
+                        prev_txt = await page.evaluate("document.body ? document.body.innerText.slice(0, 200) : ''")
                         await advance_btn.scroll_into_view_if_needed()
                         if dynamic_bridge and upstream_target:
                             print(f"🔄 Two-Stage Proxy: Activating US Residential IP ({upstream_target}) for survey questions...")
@@ -1558,22 +2202,66 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
                         await advance_btn.click()
                         print("⏳ Clicked intro advance button. Waiting for Question Page to render...")
                         
-                        # Wait up to 15 seconds for the next question page to render
+                        transition_detected = False
                         for _ in range(15):
                             await page.wait_for_timeout(1000)
                             try:
                                 next_fields = await scrape_page(page)
                                 next_btn = await find_advance_button(page)
-                                if next_fields or next_btn:
+                                curr_url = page.url
+                                curr_txt = await page.evaluate("document.body ? document.body.innerText.slice(0, 200) : ''")
+                                if next_fields or curr_url != prev_url or curr_txt != prev_txt:
                                     print(f"✅ Question Page rendered with {len(next_fields)} fields.")
+                                    transition_detected = True
                                     break
                             except Exception:
                                 pass
                                 
-                        page_num += 1
+                        if transition_detected:
+                            run_ctx.reset_watchdog()
+                            page_num += 1
                         continue
                     except Exception as e:
                         print(f"⚠️ Error clicking intro button: {e}")
+
+                elif has_questions:
+                    print(f"⚠️ Visible survey question(s) detected in DOM ({q_texts[:2]}), but semantic scraper returned 0 fields.")
+                    print("🔍 Running targeted DOM diagnostics for unparsed or custom controls...")
+                    try:
+                        diag_info = await page.evaluate("""() => {
+                            const qEls = Array.from(document.querySelectorAll('.QuestionOuter, .cf-question, .question, [data-widget="ranking"], .Ranking'));
+                            return qEls.map(q => ({
+                                tag: q.tagName,
+                                id: q.id,
+                                className: q.className,
+                                childCount: q.childElementCount,
+                                innerTextSample: q.innerText.slice(0, 100)
+                            }));
+                        }""")
+                        print(f"📋 DOM Diagnostics: {diag_info[:2]}")
+                    except Exception:
+                        pass
+
+                    if is_adv_disabled:
+                        print("ℹ️ Next button is currently disabled. Waiting for questions or controls to activate...")
+                        await page.wait_for_timeout(2000)
+
+                    # Trigger Co-Pilot mode directly with question details rather than blindly clicking Next
+                    print("⚠️ Unparsed/custom question detected. Activating Co-Pilot Mode...")
+                    run_ctx.transition_state(PageState.HUMAN_REVIEW_REQUIRED, "Unparsed question widget detected")
+                    resumed = await wait_for_human_copilot(
+                        page, page_num,
+                        reason=f"Question '{q_texts[0][:80]}' requires direct interaction on your screen.",
+                        status_callback=status_callback
+                    )
+                    if resumed:
+                        run_ctx.reset_watchdog()
+                        page_num += 1
+                        continue
+                    else:
+                        exit_reason = "TIMED_OUT"
+                        run_ctx.transition_state(PageState.TIMED_OUT, "Co-pilot timeout waiting for question completion")
+                        break
 
                 # Check if we are still under an anti-bot curtain (ONLY if no advance button is visible)
                 try:
@@ -1587,14 +2275,23 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
                 if is_covered:
                     curtain_wait_count = getattr(page, "_curtain_wait_count", 0) + 1
                     page._curtain_wait_count = curtain_wait_count
-                    if curtain_wait_count <= 10:
-                        print(f"🛡️ Anti-bot curtain active ({curtain_wait_count}/10). Simulating organic mouse telemetry & waiting for Verisoul...")
-                        target_pt = (random.randint(250, 1000), random.randint(200, 550))
-                        await human_curved_mouse_move(page, target_pt[0], target_pt[1], steps=random.randint(20, 35))
-                        await page.wait_for_timeout(1200)
+                    if curtain_wait_count <= 3:
+                        print(f"🛡️ Security or verification overlay detected ({curtain_wait_count}/3). Waiting for overlay to clear...")
+                        await page.wait_for_timeout(2000)
                         continue
                     else:
-                        print("⚠️ Anti-bot curtain wait reached limit (20s). Proceeding to survey inspection...")
+                        print("⚠️ Security / verification overlay persists. Pausing automation for human co-pilot review...")
+                        run_ctx.transition_state(PageState.HUMAN_REVIEW_REQUIRED, "Security / verification challenge overlay detected")
+                        resumed = await wait_for_human_copilot(
+                            page, page_num,
+                            reason="Security or verification overlay detected. Please review on screen to proceed.",
+                            status_callback=status_callback
+                        )
+                        if not resumed:
+                            exit_reason = "TIMED_OUT"
+                            run_ctx.transition_state(PageState.TIMED_OUT, "Co-pilot timeout on security verification")
+                            break
+                        continue
                         
                 # Check if page is simply still loading questions or rendering dynamic content
                 is_still_loading = await page.evaluate("""() => {
@@ -1630,6 +2327,7 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
                 completed, reason = await check_is_completed(page, has_answered=(len(session_memory) > 0), has_advance_btn=False)
                 if completed:
                     print(f"🏁 {reason}! Questionnaire is complete!")
+                    run_ctx.transition_state(PageState.COMPLETED, reason)
                     exit_reason = reason
                     break
                     
@@ -1639,10 +2337,12 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
                     completed, reason = await check_is_completed(page, has_answered=(len(session_memory) > 0), has_advance_btn=(advance_btn is not None))
                     if completed:
                         print(f"🏁 {reason}! Questionnaire is complete!")
+                        run_ctx.transition_state(PageState.COMPLETED, reason)
                         exit_reason = reason
                         break
                     else:
                         print("⚠️ No fields detected by scraper or vision, but page is not complete. Activating Co-Pilot Mode...")
+                        run_ctx.transition_state(PageState.HUMAN_REVIEW_REQUIRED, "Zero fields found by scraper or vision")
                         resumed = await wait_for_human_copilot(
                             page, page_num,
                             reason=f"Page {page_num} could not be parsed automatically. Please answer or click Next on your screen.",
@@ -1654,7 +2354,8 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
                             page_num += 1
                             continue
                         else:
-                            exit_reason = "Survey paused or ended by user"
+                            exit_reason = "TIMED_OUT"
+                            run_ctx.transition_state(PageState.TIMED_OUT, "Co-pilot timeout waiting for page resolution")
                             break
                 else:
                     print("⚠️ Triggering Vision LLM processing...")
@@ -1694,7 +2395,7 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
                             await page.evaluate(js_click)
                     continue
             
-            # 3. Stuck & Retry Detection (Infinite Loop Protection with Error Recovery)
+            # 3. Stuck & Retry Detection (Infinite Loop Protection with Bounded Recovery)
             current_hash = hash(str(fields))
             if current_hash == previous_fields_hash:
                 consecutive_stuck_attempts += 1
@@ -1704,9 +2405,24 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
                 current_validation_errors = await detect_validation_errors(page)
                 if current_validation_errors:
                     print(f"⚠️ Validation errors detected on page: {current_validation_errors}")
+                    run_ctx.transition_state(PageState.VALIDATION_ERROR, str(current_validation_errors))
                     
-                if consecutive_stuck_attempts >= 2:
+                # Bounded non-blocking recovery: on attempt 2 or 3, perform pre-flight sweep and scroll
+                if consecutive_stuck_attempts in [2, 3]:
+                    print("🔄 Running bounded self-recovery: re-verifying required fields and re-scrolling to Next button...")
+                    await verify_and_fill_unanswered_fields(
+                        page, fields, answers if 'answers' in locals() else {}, session_memory, persona=run_persona, user_email=resolved_email, run_context=run_ctx
+                    )
+                    advance_btn = await find_advance_button(page)
+                    if advance_btn and await advance_btn.is_visible():
+                        await advance_btn.scroll_into_view_if_needed()
+                        await human_click_element(page, advance_btn)
+                        await page.wait_for_timeout(2000)
+                        continue
+
+                if consecutive_stuck_attempts >= max_stuck_attempts:
                     print(f"⚠️ Page {page_num} has not advanced after {consecutive_stuck_attempts} attempts. Activating Co-Pilot Mode to protect AI tokens...")
+                    run_ctx.transition_state(PageState.HUMAN_REVIEW_REQUIRED, "Page stuck threshold reached")
                     resumed = await wait_for_human_copilot(
                         page, page_num,
                         reason=f"Page {page_num} has not advanced. Please complete any missed fields or click Next on your screen.",
@@ -1718,150 +2434,201 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
                         page_num += 1
                         continue
                     else:
+                        exit_reason = "TIMED_OUT"
+                        run_ctx.transition_state(PageState.TIMED_OUT, "Co-pilot timeout waiting for page advance")
                         break
             else:
                 consecutive_stuck_attempts = 0
                 current_validation_errors = []
                 previous_fields_hash = current_hash
                 
-            # 4. Strict 'Other' Neglect Filter (Saves AI Credits & Eliminates 'Other' Hallucinations)
-            ai_fields = []
-            pre_filled_answers = {}
+            # 4. Incremental Inventory Check: Skip AI call if all fields on this page are already answered & verified!
+            unanswered_fields = []
             for f in fields:
-                raw_lbl = f.get("label") or ""
-                lbl_lower = raw_lbl.lower()
-                role = f.get("role")
-                is_other = bool(re.search(r'\b(other|another|specify)\b', lbl_lower))
-                
-                # Check if this is an "Other" option or "Other" textbox when standard choices exist
-                if is_other and role in ["textbox", "checkbox", "radio"]:
-                    stem = re.split(r'[-–—:]\s*(?:other|another|specify)', lbl_lower, flags=re.IGNORECASE)[0].strip()
-                    has_siblings = any(stem in (other_f.get("label") or "").lower() for other_f in fields if other_f["id"] != f["id"])
-                    if has_siblings:
-                        # Auto-neglect: zero AI tokens wasted, immediately set to False / empty!
-                        val_to_set = False if role == "checkbox" else ""
-                        pre_filled_answers[f["id"]] = {"value": val_to_set, "confidence": 1.0, "source": "persona"}
-                        print(f"🚫 Neglecting 'Other' field '{raw_lbl}' (saved AI credits).")
-                        continue
-                ai_fields.append(f)
-
-            # 4b. Query LLM with only the legitimate non-other choices!
-            if ai_fields:
-                answers = await get_form_answers(ai_fields, session_memory, validation_errors=current_validation_errors, persona=run_persona)
+                fp = f.get("fingerprint")
+                norm_q = run_ctx.question_inventory.get(fp)
+                if not norm_q or norm_q.status != AnswerStatus.VERIFIED:
+                    unanswered_fields.append(f)
+                    
+            if fields and not unanswered_fields and advance_btn:
+                print(f"⚡ Incremental Scan: All {len(fields)} fields on Page {page_num} are already answered and verified. Skipping duplicate AI call!")
+                answers = {f["id"]: {"value": session_memory.get(f.get("label", ""), ""), "confidence": 1.0, "source": "persona"} for f in fields}
             else:
-                answers = {}
-            # Merge pre-filled auto-neglected answers
-            answers.update(pre_filled_answers)
-            
-            if not answers:
-                print("⚠️ AI Engine returned empty answers for this page. Activating Co-Pilot Mode...")
-                resumed = await wait_for_human_copilot(
-                    page, page_num,
-                    reason=f"AI returned empty answers for Page {page_num}. Please answer or click Next on your screen.",
-                    status_callback=status_callback
-                )
-                if resumed:
-                    consecutive_stuck_attempts = 0
-                    previous_fields_hash = None
-                    page_num += 1
-                    continue
+                # 4a. Strict 'Other' Neglect Filter (Saves AI Credits & Eliminates 'Other' Hallucinations)
+                ai_fields = []
+                pre_filled_answers = {}
+                for f in fields:
+                    raw_lbl = f.get("label") or ""
+                    lbl_lower = raw_lbl.lower()
+                    role = f.get("role")
+                    is_other = bool(re.search(r'\b(other|another|specify)\b', lbl_lower))
+                    
+                    if is_other and role in ["textbox", "checkbox", "radio"]:
+                        stem = re.split(r'[-–—:]\s*(?:other|another|specify)', lbl_lower, flags=re.IGNORECASE)[0].strip()
+                        has_siblings = any(stem in (other_f.get("label") or "").lower() for other_f in fields if other_f["id"] != f["id"])
+                        if has_siblings:
+                            val_to_set = False if role == "checkbox" else ""
+                            pre_filled_answers[f["id"]] = {"value": val_to_set, "confidence": 1.0, "source": "persona"}
+                            print(f"🚫 Neglecting 'Other' field '{raw_lbl}' (saved AI credits).")
+                            continue
+                    ai_fields.append(f)
+
+                # 4b. Query LLM with only the legitimate non-other choices!
+                run_ctx.transition_state(PageState.ANSWER_GENERATION)
+                if ai_fields:
+                    answers = await get_form_answers(ai_fields, session_memory, validation_errors=current_validation_errors, persona=run_persona, run_context=run_ctx)
                 else:
-                    break
+                    answers = {}
+                answers.update(pre_filled_answers)
                 
-            # 4c. Deterministic Sanitization: Prevent 'unselected answer choice' error for Other/Specify textboxes
-            sanitize_other_specify_fields(fields, answers)
-            enforce_age_and_dob_consistency(fields, answers, session_memory)
-            enforce_user_section_rules(fields, answers, instructions)
-                
-            # 5. Act (Universally Fill Fields)
-            filled_count = 0
-            for f in fields:
-                f_id = f["id"]
-                if f_id in answers:
-                    await fill_field(page, f, answers[f_id])
-                    session_memory[f.get("label", "Unknown")] = answers[f_id]["value"]
-                    filled_count += 1
-                    
-            # 5b. Dynamic Branching & Unhidden Field Check:
-            # When answers are selected (e.g. Yes to Zoom, opt-ins, or condition screeners),
-            # survey engines (REDCap, Qualtrics) dynamically reveal conditional questions on the same page.
-            for branch_pass in range(3):
-                await page.wait_for_timeout(800)
-                re_scraped_fields = await scrape_page(page)
-                
-                # Check for any truly new visible fields revealed dynamically
-                unfilled_new_fields = []
-                known_ids = set(answers.keys())
-                for rf in re_scraped_fields:
-                    r_id = rf.get("id")
-                    if r_id in known_ids or rf.get("label") in session_memory:
+                if not answers:
+                    print("⚠️ AI Engine returned empty answers for this page. Activating Co-Pilot Mode...")
+                    run_ctx.transition_state(PageState.HUMAN_REVIEW_REQUIRED, "Empty AI answers")
+                    resumed = await wait_for_human_copilot(
+                        page, page_num,
+                        reason=f"AI returned empty answers for Page {page_num}. Please answer or click Next on your screen.",
+                        status_callback=status_callback
+                    )
+                    if resumed:
+                        consecutive_stuck_attempts = 0
+                        previous_fields_hash = None
+                        page_num += 1
                         continue
+                    else:
+                        exit_reason = "TIMED_OUT"
+                        run_ctx.transition_state(PageState.TIMED_OUT, "Co-pilot timeout on empty AI answers")
+                        break
                     
-                    # Also skip neglected 'Other' fields
-                    lbl_lower = (rf.get("label") or "").lower()
-                    if re.search(r'\b(other|another|specify)\b', lbl_lower) and rf.get("role") in ["checkbox", "textbox"]:
-                        continue
-
-                    val = await page.evaluate(r"""(id) => {
-                        const el = document.querySelector(`[data-stillbot-id="${id}"]`);
-                        if (!el) return null;
-                        const role = el.getAttribute('role') || el.type;
-                        if (role === 'radio') {
-                            if (el.getAttribute('aria-checked') === 'true') return 'checked';
-                            const name = el.name;
-                            if (name) {
-                                const checked = document.querySelector(`input[name="${name}"]:checked`);
-                                if (checked) return checked.value || 'checked';
-                            }
-                            const parentGroup = el.closest('[role="radiogroup"], fieldset, .geS5n, .cf-question');
-                            if (parentGroup && parentGroup.querySelector('[aria-checked="true"], input:checked')) return 'checked';
-                            return '';
-                        }
-                        if (role === 'checkbox') {
-                            if (el.getAttribute('aria-checked') === 'true' || el.checked) return 'checked';
-                            return '';
-                        }
-                        return el.value || '';
-                    }""", r_id)
-                    if not val:
-                        unfilled_new_fields.append(rf)
-
-                if not unfilled_new_fields:
-                    break
-
-                print(f"🔄 Detected {len(unfilled_new_fields)} newly revealed conditional field(s). Filling them...")
-                new_answers = await get_form_answers(unfilled_new_fields, session_memory, persona=run_persona)
-                if new_answers:
-                    sanitize_other_specify_fields(unfilled_new_fields, new_answers)
-                    enforce_age_and_dob_consistency(unfilled_new_fields, new_answers, session_memory)
-                    for nf in unfilled_new_fields:
-                        n_id = nf["id"]
-                        if n_id in new_answers:
-                            await fill_field(page, nf, new_answers[n_id])
-                            session_memory[nf.get("label", "Unknown")] = new_answers[n_id]["value"]
+                # 4c. Deterministic Sanitization
+                sanitize_other_specify_fields(fields, answers)
+                enforce_age_and_dob_consistency(fields, answers, session_memory)
+                enforce_user_section_rules(fields, answers, instructions)
+                    
+                # 5. Act (Universally Fill Fields)
+                run_ctx.transition_state(PageState.FILLING)
+                filled_count = 0
+                for f in fields:
+                    f_id = f["id"]
+                    if f_id in answers:
+                        ans_obj = answers[f_id]
+                        ans_val = ans_obj.get("value")
+                        ans_status = ans_obj.get("status", "").upper()
+                        # Do not attempt to fill None or empty string on required fields
+                        if ans_val is None or str(ans_val).strip() == "" or str(ans_val).strip().lower() == "none" or ans_status in ["UNANSWERABLE", "NEEDS_CLARIFICATION", "INVALID"]:
+                            if f.get("required"):
+                                print(f"⚠️ Required field '{f.get('label')}' is unresolved. Cannot fill with empty value.")
+                            else:
+                                print(f"ℹ️ Optional field '{f.get('label')}' is unresolved/empty. Leaving blank.")
+                            continue
+                            
+                        await fill_field(page, f, ans_obj)
+                        if ans_val is not None and str(ans_val).strip() != "":
                             filled_count += 1
-                            answers[n_id] = new_answers[n_id]
-                    fields.extend([nf for nf in unfilled_new_fields if nf not in fields])
+                            is_ok, live_val, err = await verify_control_state(page, f, ans_val)
+                            fp = f.get("fingerprint") or f.get("logical_id")
+                            if fp:
+                                if is_ok:
+                                    session_memory[f.get("label", "Unknown")] = live_val or ans_val
+                                    run_ctx.mark_verified(fp, live_val)
+                                else:
+                                    print(f"⚠️ Live state verification failed for '{f.get('label')}': {err}")
+                                    run_ctx.mark_validation_failed(fp, err or "Verification failed")
+                run_ctx.transition_state(PageState.VERIFYING)
+
+                # Check if any required field on this page is unresolved or unverified in DOM
+                page_unresolved_required = []
+                for f in fields:
+                    if f.get("required"):
+                        fid = f.get("id")
+                        fp = f.get("fingerprint") or f.get("logical_id")
+                        is_missing_or_empty = (
+                            fid not in answers 
+                            or answers[fid].get("value") is None 
+                            or str(answers[fid].get("value")).strip() == "" 
+                            or answers[fid].get("status", "").upper() in ["UNANSWERABLE", "NEEDS_CLARIFICATION", "INVALID"]
+                        )
+                        is_dom_unverified = False
+                        if fp and fp in run_ctx.question_inventory:
+                            is_dom_unverified = run_ctx.question_inventory[fp].status != AnswerStatus.VERIFIED
+                        if is_missing_or_empty or is_dom_unverified:
+                            page_unresolved_required.append(f)
+
+                if page_unresolved_required:
+                    unres_labels = [f.get("label", "Required Question") for f in page_unresolved_required]
+                    print(f"⚠️ Page {page_num} has {len(page_unresolved_required)} unresolved/unverified required question(s): {unres_labels}. Engaging Co-Pilot Mode...")
+                    run_ctx.transition_state(PageState.HUMAN_REVIEW_REQUIRED, f"{len(page_unresolved_required)} required field(s) unresolved or unverified")
+                    resumed = await wait_for_human_copilot(
+                        page, page_num,
+                        reason=f"Required question(s) ({', '.join(unres_labels[:3])}) could not be resolved or verified in the browser. Please complete or review on screen.",
+                        status_callback=status_callback
+                    )
+                    if not resumed:
+                        exit_reason = "TIMED_OUT"
+                        run_ctx.transition_state(PageState.TIMED_OUT, f"Co-pilot timeout on required questions: {', '.join(unres_labels[:3])}")
+                        break
+                    else:
+                        consecutive_stuck_attempts = 0
+                        previous_fields_hash = None
+                        page_num += 1
+                        continue
+                        
+                # 5b. Incremental Dynamic Branching Check (handles up to 4 tiers of conditional revealing)
+                for branch_pass in range(4):
+                    await page.wait_for_timeout(600)
+                    re_scraped_fields = await scrape_page(page)
+                    newly_appeared = run_ctx.register_discovered_questions(re_scraped_fields)
+                    
+                    unfilled_new_fields = []
+                    for rf in re_scraped_fields:
+                        rf_fp = rf.get("fingerprint")
+                        rf_lid = rf.get("logical_id")
+                        q_obj = run_ctx.question_inventory.get(rf_fp) or run_ctx.question_inventory.get(rf_lid)
+                        if not q_obj or q_obj.status != AnswerStatus.VERIFIED:
+                            lbl_lower = (rf.get("label") or "").lower()
+                            if re.search(r'\b(other|another|specify)\b', lbl_lower) and rf.get("role") in ["checkbox", "textbox"]:
+                                continue
+                            unfilled_new_fields.append(rf)
+                            
+                    if not unfilled_new_fields:
+                        break
+
+                    print(f"🔄 Detected {len(unfilled_new_fields)} newly revealed conditional field(s) (tier {branch_pass + 1}). Filling incrementally...")
+                    new_answers = await get_form_answers(unfilled_new_fields, session_memory, persona=run_persona, run_context=run_ctx)
+                    if new_answers:
+                        sanitize_other_specify_fields(unfilled_new_fields, new_answers)
+                        enforce_age_and_dob_consistency(unfilled_new_fields, new_answers, session_memory)
+                        for nf in unfilled_new_fields:
+                            n_id = nf["id"]
+                            if n_id in new_answers:
+                                await fill_field(page, nf, new_answers[n_id])
+                                session_memory[nf.get("label", "Unknown")] = new_answers[n_id]["value"]
+                                filled_count += 1
+                                answers[n_id] = new_answers[n_id]
+                                is_ok, live_val, err = await verify_control_state(page, nf, new_answers[n_id]["value"])
+                                n_fp = nf.get("fingerprint") or nf.get("logical_id")
+                                if n_fp:
+                                    if is_ok:
+                                        run_ctx.mark_verified(n_fp, live_val)
+                                    else:
+                                        run_ctx.mark_validation_failed(n_fp, err or "Verification failed")
+                        fields.extend([nf for nf in unfilled_new_fields if nf not in fields])
 
             if status_callback:
                 try:
-                    await status_callback(f"📝 **Page {page_num} Progress:**\n• Answered {filled_count} question(s)\n• Advancing to next page...\n• 🔗 Live Survey URL: `{page.url}`")
+                    await status_callback(f"📝 **Page {page_num} Progress:**\n• Answered {filled_count if 'filled_count' in locals() else len(fields)} question(s)\n• Advancing to next page...\n• 🔗 Live Survey URL: `{page.url}`")
                 except Exception:
                     pass
 
-            await page.wait_for_timeout(500)
+            await page.wait_for_timeout(400)
             
             # 5c. Pre-Flight Zero-Token Verification: "Have I answered all questions on this page?"
-            # Sweeps the live DOM to ensure no radio group, select dropdown, or required field was left unselected.
             unanswered_resolved = await verify_and_fill_unanswered_fields(
-                page, fields, answers, session_memory, persona=run_persona, user_email=resolved_email
+                page, fields, answers, session_memory, persona=run_persona, user_email=resolved_email, run_context=run_ctx
             )
             if unanswered_resolved > 0:
                 print(f"✅ Pre-Flight Verification: Automatically resolved {unanswered_resolved} unselected field(s) before advancing.")
-                filled_count += unanswered_resolved
             
             # 5d. Synchronize session_memory directly from the live DOM state right before clicking Next/Submit!
-            # Eliminates ANY discrepancy between what was clicked on the screen and what is printed in the summary!
             await sync_live_dom_to_session_memory(page, session_memory)
             
             # 6. Navigate (Find and Click Next / Continue / Submit)
@@ -1871,6 +2638,8 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
                 if target_btn and await target_btn.is_visible():
                     if config.DRY_RUN:
                         print("🛑 DRY_RUN enabled. Stopping before clicking Next/Submit.")
+                        exit_reason = "DRY_RUN_COMPLETED"
+                        run_ctx.transition_state(PageState.DRY_RUN_COMPLETED, "DRY_RUN: Fields staged and verified, submission skipped")
                         break
                     else:
                         btn_name = ""
@@ -1931,6 +2700,25 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
                         except Exception as e:
                             print(f"⚠️ Auto-sign error: {e}")
 
+                        # Check blocking modal before clicking navigation button
+                        modal_info = await detect_blocking_modal(page)
+                        if modal_info.get("found"):
+                            can_cont, m_res = await handle_blocking_modal(page, page_num, run_ctx, status_callback)
+                            if not can_cont:
+                                exit_reason = "TIMED_OUT" if run_ctx.page_state == PageState.TIMED_OUT else f"BLOCKED: {m_res}"
+                                break
+                            continue
+
+                        # Check if button is disabled
+                        try:
+                            is_btn_disabled = await target_btn.is_disabled()
+                        except Exception:
+                            is_btn_disabled = False
+                        if is_btn_disabled:
+                            print("⚠️ Next/Submit button is disabled. Waiting for DOM or required questions...")
+                            await page.wait_for_timeout(2000)
+                            continue
+
                         await target_btn.scroll_into_view_if_needed()
                         if dynamic_bridge and upstream_target and dynamic_bridge.upstream_proxy is None:
                             print(f"🔄 Two-Stage Proxy: Activating US Residential IP ({upstream_target}) for survey questions...")
@@ -1939,11 +2727,15 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
                         await human_click_element(page, target_btn)
                         
                         print("⏳ Waiting for page transition...")
+                        transition_occurred = False
                         for _ in range(20):
                             await page.wait_for_timeout(500)
                             try:
-                                if page.url != prev_url:
+                                curr_url = page.url
+                                curr_html = await page.evaluate("document.body ? document.body.innerHTML : ''")
+                                if curr_url != prev_url:
                                     print("✅ URL navigation detected!")
+                                    transition_occurred = True
                                     break
                                 # Check for validation/alert dialog (e.g. Confirmit "Response Requested", REDCap, SweetAlert)
                                 cont_without_answering = page.locator('button:has-text("Continue Without Answering"), a:has-text("Continue Without Answering"), input[value*="Continue Without Answering" i], button:has-text("Continue without answering")').first
@@ -1969,14 +2761,19 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
                                     await modal_btn.click(force=True)
                                     await page.wait_for_timeout(500)
                                     break
-                                curr_html = await page.evaluate("document.body ? document.body.innerHTML : ''")
                                 if curr_html != prev_html:
                                     print("✅ DOM transition detected!")
+                                    transition_occurred = True
                                     break
                             except Exception:
                                 pass
                                 
                         await page.wait_for_timeout(2500)
+                        if transition_occurred:
+                            run_ctx.reset_watchdog()
+                            page_num += 1
+                        else:
+                            print(f"⚠️ Page {page_num} did not transition after click. Remaining on Page {page_num}.")
                 else:
                     print("⚠️ No standard button found. Pressing Enter...")
                     if config.DRY_RUN:
@@ -1997,16 +2794,21 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
                             if resumed:
                                 consecutive_stuck_attempts = 0
                                 previous_fields_hash = None
+                                run_ctx.reset_watchdog()
                                 page_num += 1
                                 continue
                             else:
+                                exit_reason = "TIMED_OUT"
+                                run_ctx.transition_state(PageState.TIMED_OUT, "Co-pilot timeout waiting for Enter advancement")
                                 break
+                        else:
+                            run_ctx.reset_watchdog()
+                            page_num += 1
                     except Exception:
                         pass
             except Exception as e:
                 print(f"❌ Navigation failed: {e}")
                 break
-            page_num += 1
             
         # Final Reward Link Inspection & Auto-Claim
         reward_info = None
@@ -2021,12 +2823,59 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
         except Exception as e:
             print(f"⚠️ Reward processing error: {e}")
 
-        # Final Summary & Proof Screenshot
+        # Validate that all required questions across all pages were verified
+        is_all_verified, unverified_qs = run_ctx.validate_completion()
+        if not is_all_verified:
+            unv_names = [q.label for q in unverified_qs[:3]]
+            print(f"⚠️ Final verification: {len(unverified_qs)} required question(s) were never verified ({unv_names}).")
+            if not exit_reason or exit_reason in ["Completed", "DRY_RUN_COMPLETED"]:
+                exit_reason = f"Incomplete: Required question(s) unverified ({', '.join(unv_names)})"
+                run_ctx.transition_state(PageState.FAILED, exit_reason)
+
+        if config.DRY_RUN:
+            if not exit_reason or exit_reason == "Completed":
+                exit_reason = "DRY_RUN_COMPLETED"
+                run_ctx.transition_state(PageState.DRY_RUN_COMPLETED, "DRY_RUN: Staged and verified answers without submission")
+
+        # Determine honest completion banner and success status
+        is_truly_completed = False
+        if exit_reason == "Completed" or run_ctx.page_state == PageState.COMPLETED:
+            if is_all_verified:
+                status_banner = "✅ QUESTIONNAIRE COMPLETED"
+                is_truly_completed = True
+            else:
+                status_banner = f"⚠️ QUESTIONNAIRE INCOMPLETE: {exit_reason}"
+        elif exit_reason == "DRY_RUN_COMPLETED" or run_ctx.page_state == PageState.DRY_RUN_COMPLETED:
+            if is_all_verified:
+                status_banner = "🛑 DRY RUN COMPLETED (Answers Staged & Verified; Submission Skipped)"
+                is_truly_completed = True
+            else:
+                status_banner = f"⚠️ DRY RUN INCOMPLETE: {exit_reason}"
+        elif run_ctx.page_state == PageState.TIMED_OUT or exit_reason == "TIMED_OUT":
+            status_banner = "⏱️ QUESTIONNAIRE TIMED OUT (Co-Pilot or Navigation Timeout)"
+        elif run_ctx.page_state == PageState.BLOCKED or (exit_reason and exit_reason.startswith("BLOCKED")):
+            status_banner = f"🛑 QUESTIONNAIRE BLOCKED ({exit_reason})"
+        elif run_ctx.page_state == PageState.HUMAN_REVIEW_REQUIRED:
+            status_banner = f"🤝 QUESTIONNAIRE PAUSED (Human Review Required: {exit_reason})"
+        else:
+            status_banner = f"⚠️ QUESTIONNAIRE STOPPED ({exit_reason or run_ctx.page_state.value})"
+
+        # Final Summary & Performance Optimization Metrics
         print("\n==================================")
-        print("✅ QUESTIONNAIRE COMPLETED")
+        print(status_banner)
         print("==================================")
         print("Audit Trail (What was filled):")
         print(json.dumps(session_memory, indent=2))
+        print(f"Final Exit Reason: {exit_reason}")
+        
+        print("\n==================================")
+        print("📊 STILLBOT TOKEN & PERFORMANCE METRICS")
+        print(f"• Total AI Calls: {run_ctx.token_metrics.get('ai_calls', 0)}")
+        print(f"• Est. Prompt Tokens: {run_ctx.token_metrics.get('prompt_tokens_est', 0)}")
+        print(f"• Est. Completion Tokens: {run_ctx.token_metrics.get('completion_tokens_est', 0)}")
+        print(f"• Question Cache Hits: {run_ctx.token_metrics.get('cache_hits', 0)}")
+        print(f"• Deterministic Fact Hits: {run_ctx.token_metrics.get('deterministic_hits', 0)}")
+        print("==================================\n")
         
         screenshot_path = f"artifacts/final_survey_result_run_{run_index}.png"
         try:
@@ -2057,13 +2906,20 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
             shutil.rmtree(temp_user_data_dir, ignore_errors=True)
         except Exception:
             pass
+
+        clean_summary = {k: v for k, v in session_memory.items() if v is not None and str(v).strip() != ""}
         return {
-            "summary": session_memory,
-            "exit_reason": exit_reason or "Completed",
+            "summary": clean_summary,
+            "exit_reason": exit_reason or ("DRY_RUN_COMPLETED" if config.DRY_RUN else "Completed"),
+            "dry_run": config.DRY_RUN,
+            "dry_run_details": "Answers staged and verified in DOM; submission did not occur" if config.DRY_RUN else None,
             "screenshot_path": screenshot_path,
             "reward": reward_info,
             "final_url": final_page_url,
-            "final_page": page_num
+            "final_page": page_num,
+            "metrics": run_ctx.token_metrics,
+            "is_completed": is_truly_completed,
+            "page_state": run_ctx.page_state.value
         }
 
 if __name__ == "__main__":

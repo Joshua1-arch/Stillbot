@@ -144,7 +144,7 @@ async def get_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Next, please send me the **Gmail / Email Address(es)** you want the bot to use.\n"
             "(You can send multiple comma-separated emails, e.g. user1@gmail.com, user2@gmail.com)\n\n"
             "💡 *Tip: You can save emails permanently into your pool using `/addemails ...`*\n\n"
-            "If you want the bot to invent a random email or skip, tap **skip**.",
+            "If you want to skip providing an email now, tap **skip**.",
             reply_markup=reply_markup
         )
     return EMAIL
@@ -190,7 +190,7 @@ async def handle_email_callback(update: Update, context: ContextTypes.DEFAULT_TY
         chosen_emails = [pool[i]["email"] for i in sorted(selected_indices) if i < len(pool)]
         if not chosen_emails:
             context.user_data['email'] = None
-            await query.edit_message_text("✅ No emails selected from pool. The bot will invent an email if needed.")
+            await query.edit_message_text("✅ No emails selected from pool. Proceeding without pre-set email.")
         else:
             context.user_data['email'] = ", ".join(chosen_emails)
             emails_display = "\n".join([f"• `{e}`" for e in chosen_emails])
@@ -218,7 +218,7 @@ async def get_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if text.lower() == 'skip':
         context.user_data['email'] = None
-        await update.message.reply_text("✅ Skipping email (the bot will invent one if needed).")
+        await update.message.reply_text("✅ Skipping email (will request if required).")
     else:
         context.user_data['email'] = text
         await update.message.reply_text("✅ Email(s) saved!")
@@ -370,8 +370,8 @@ async def start_execution(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"2. For ANY question asking for State, Province, or Region, you MUST select or write: {region_str}\n"
                 f"3. For ANY question asking for City, you MUST write: {city_str}\n"
                 f"4. For ANY question asking for {zip_label}, you MUST write: {zip_str}\n"
-                f"5. Street Address: You MUST invent an authentic, realistic residential street address located inside {city_str}, {region_str} {zip_str}, {country_name}.\n"
-                f"6. DO NOT randomize or invent another City, State, or {zip_label}. The survey researcher verifies your submission against your IP geolocation! Any discrepancy will disqualify the survey.\n"
+                f"5. Street Address: If street address is requested and not provided in persona, do NOT invent a fake or placeholder address. Request clarification or mark unanswerable.\n"
+                f"6. DO NOT randomize or invent another City, State, or {zip_label}. Ensure consistency with confirmed facts.\n"
             )
             instance_instructions = base_instructions + location_binding
             bot_proxy_param = f"two_stage:{proxy_url}" if is_two_stage else proxy_url
@@ -387,7 +387,7 @@ async def start_execution(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if e:
             instance_instructions += f"\nCRITICAL PRIORITY: You MUST use the email address: {e}\n"
         if len(emails) > 1:
-            instance_instructions += f"\nBATCH ITERATION {idx}: You may vary your Name and Age to appear as a unique respondent, but you MUST strictly maintain the City, State, and ZIP matching the IP above.\n"
+            instance_instructions += f"\nBATCH ITERATION {idx}: Executing run {idx} for account {e}. Strictly adhere to confirmed respondent facts.\n"
             
         async def send_status(msg: str):
             try:

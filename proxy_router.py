@@ -20,29 +20,29 @@ def _fmt_pool(env_key: str, ports: list[int] | range, default_auth: str = "") ->
 # --- Verified Geonix Residential Proxy Pools (Dynamically Configured) ---
 PROXY_POOLS = {
     # 100 General US Residential Ports (10000-10099)
-    "general": _fmt_pool("PROXY_GENERAL_AUTH", range(10000, 10100), "e5a62faadbd9f100:YdC2FJBcXM6WPyTv"),
+    "general": _fmt_pool("PROXY_GENERAL_AUTH", range(10000, 10100)),
     
     # 500 Australia Residential Ports (10000-10499)
-    "australia": _fmt_pool("PROXY_AUSTRALIA_AUTH", range(10000, 10500), "d5990ead70c9f188:dIaWRAmL8jVUuMhY"),
+    "australia": _fmt_pool("PROXY_AUSTRALIA_AUTH", range(10000, 10500)),
     
     # 50 New York Residential Ports (10000-10049)
-    "new york": _fmt_pool("PROXY_NEWYORK_AUTH", range(10000, 10050), "0664e880e61d2629:x3cmtGIbPfv0e7F8"),
+    "new york": _fmt_pool("PROXY_NEWYORK_AUTH", range(10000, 10050)),
     
     # 50 Florida Residential Ports (10000-10049)
-    "florida": _fmt_pool("PROXY_FLORIDA_AUTH", range(10000, 10050), "f72d6d1e420a7d67:RDPKh179Ad6x85on"),
+    "florida": _fmt_pool("PROXY_FLORIDA_AUTH", range(10000, 10050)),
     
     # 50 Illinois Residential Ports (10000-10049)
-    "illinois": _fmt_pool("PROXY_ILLINOIS_AUTH", range(10000, 10050), "5fad7d7c2d3754ac:Oxsm6NeoyBn3Xtc4"),
+    "illinois": _fmt_pool("PROXY_ILLINOIS_AUTH", range(10000, 10050)),
     
     # 5 California Residential Ports (10000-10004)
-    "california": _fmt_pool("PROXY_CALIFORNIA_AUTH", range(10000, 10005), "3112be61bb44f846:Ln05ySo6ARtTJpiV"),
+    "california": _fmt_pool("PROXY_CALIFORNIA_AUTH", range(10000, 10005)),
     
     # Single Dedicated Residential Ports (10000)
-    "utah": _fmt_pool("PROXY_UTAH_AUTH", [10000], "3c3f6ca5612a8b44:EboceDjMmswvInGl"),
-    "texas": _fmt_pool("PROXY_TEXAS_AUTH", [10000], "f38592e76d5dd8d2:qhHZBFsbMr2zNQXy"),
-    "pennsylvania": _fmt_pool("PROXY_PENNSYLVANIA_AUTH", [10000], "4ea60e7f302009e6:h9tEFS37GIn8oBbf"),
-    "new jersey": _fmt_pool("PROXY_NEWJERSEY_AUTH", [10000], "6a50785e6b1c2ebc:N5wY97WqaKlDTiPt"),
-    "maryland": _fmt_pool("PROXY_MARYLAND_AUTH", [10000], "8bea34bbbf06e9e5:LN5QDjZtnWcedvyo")
+    "utah": _fmt_pool("PROXY_UTAH_AUTH", [10000]),
+    "texas": _fmt_pool("PROXY_TEXAS_AUTH", [10000]),
+    "pennsylvania": _fmt_pool("PROXY_PENNSYLVANIA_AUTH", [10000]),
+    "new jersey": _fmt_pool("PROXY_NEWJERSEY_AUTH", [10000]),
+    "maryland": _fmt_pool("PROXY_MARYLAND_AUTH", [10000])
 }
 
 # State and city keywords to canonical state pool mapping
@@ -208,7 +208,8 @@ async def get_proxy_ip_info(proxy_url: str) -> dict:
     IP Address, City, State/Region, and Postal/ZIP Code.
     Includes automatic fallback to ensure 100% uptime.
     """
-    is_au_proxy = "d5990ead70c9f188" in proxy_url
+    au_auth = os.getenv("PROXY_AUSTRALIA_AUTH", "")
+    is_au_proxy = (bool(au_auth) and au_auth in proxy_url) or "australia" in proxy_url
     default_country = "AU" if is_au_proxy else "US"
     default_tz = "Australia/Sydney" if is_au_proxy else "America/New_York"
 

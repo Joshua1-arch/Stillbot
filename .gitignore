@@ -25,6 +25,8 @@ survey_summary.txt
 # Scratch experimentation scripts & test dumps
 scratch/
 test_*.py
+!tests/
+!tests/test_*.py
 test_pages/
 
 # System files
