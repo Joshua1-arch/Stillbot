@@ -836,16 +836,20 @@ class RemoteSessionManager:
                     await source_loc.scroll_into_view_if_needed()
                     await target_loc.scroll_into_view_if_needed()
 
+                    # Check for drag handle to ensure pointer events bind properly
+                    handle_loc = source_loc.locator('[data-copilot-handle-id], [data-stillbot-handle-id], [class*="handle" i], [class*="grip" i], button[aria-label*="reorder" i], svg').first
+                    drag_origin = handle_loc if (await handle_loc.count() > 0) else source_loc
+
                     # Attempt multi-strategy drag
                     drag_worked = False
                     try:
-                        await source_loc.drag_to(target_loc, timeout=4000)
+                        await drag_origin.drag_to(target_loc, timeout=4000)
                         await page.wait_for_timeout(400)
                         drag_worked = True
                     except Exception:
                         # Fallback pointer simulation
                         try:
-                            s_box = await source_loc.bounding_box()
+                            s_box = await drag_origin.bounding_box()
                             t_box = await target_loc.bounding_box()
                             if s_box and t_box:
                                 sx, sy = s_box["x"] + s_box["width"] / 2, s_box["y"] + s_box["height"] / 2
@@ -871,8 +875,8 @@ class RemoteSessionManager:
                                 ['dragenter', 'dragover', 'drop'].forEach(ev => tgt.dispatchEvent(new DragEvent(ev, { bubbles: true, cancelable: true, dataTransfer: dt })));
                                 ['dragend'].forEach(ev => src.dispatchEvent(new DragEvent(ev, { bubbles: true, cancelable: true, dataTransfer: dt })));
                                 return true;
-                            }""", {"src": await source_loc.element_handle(), "tgt": await target_loc.element_handle()})
-                            await page.wait_for_timeout(400)
+                            }""", {"src": await drag_origin.element_handle(), "tgt": await target_loc.element_handle()})
+                            await page.wait_for_timeout(300)
                             drag_worked = True
                         except Exception:
                             pass
@@ -945,12 +949,16 @@ class RemoteSessionManager:
                     if not target_slot or await target_slot.count() == 0:
                         return {"success": False, "error": f"Target position '{target_pos}' is out of range."}
 
+                    # Check for drag handle on source element
+                    handle_loc = source_loc.locator('[data-copilot-handle-id], [data-stillbot-handle-id], [class*="handle" i], [class*="grip" i], button[aria-label*="reorder" i], svg').first
+                    drag_origin = handle_loc if (await handle_loc.count() > 0) else source_loc
+
                     # Drag source into target slot
                     try:
-                        await source_loc.drag_to(target_slot, timeout=4000)
+                        await drag_origin.drag_to(target_slot, timeout=4000)
                         await page.wait_for_timeout(400)
                     except Exception:
-                        s_box = await source_loc.bounding_box()
+                        s_box = await drag_origin.bounding_box()
                         t_box = await target_slot.bounding_box()
                         if s_box and t_box:
                             await page.mouse.move(s_box["x"] + s_box["width"] / 2, s_box["y"] + s_box["height"] / 2)

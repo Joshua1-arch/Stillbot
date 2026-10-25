@@ -739,27 +739,42 @@ class RankingHandler(WidgetHandler):
             const targetDropId = data ? data.targetDropId : null;
             let container = containerId ? document.querySelector(`[data-stillbot-id="${containerId}"]`) : null;
             if (!container) {
-                container = document.querySelector('.Group.Ranked, .ui-sortable, [data-widget="ranking"], ul.sortable, .ranking-container, [role="list"]') || document.body;
+                container = document.querySelector('.QuestionOuter, .question-container, .Group.Ranked, .ui-sortable, [data-widget="ranking"], ul.sortable, .ranking-container, [role="list"], .q-ranking, [class*="ranking" i], [class*="sortable" i]') || document.body;
             }
 
             // 1. Draggable / Rankable Items
-            const itemSelectors = 'li, [draggable="true"], .rank-item, .sortable-item, .draggable-row, .Selection, [data-choice-id], [role="listitem"]';
+            const itemSelectors = 'li, [draggable="true"], .rank-item, .sortable-item, .draggable-row, .Selection, [data-choice-id], [role="listitem"], .q-ranking-item, [class*="card" i]:has([class*="handle" i]), [class*="item" i]:has([class*="handle" i]), div:has(> [class*="handle" i]), div:has(> button[aria-label*="reorder" i])';
             const allItems = Array.from(container.querySelectorAll(itemSelectors)).filter(el => {
-                if (el.offsetParent === null) return false;
+                if (el.matches('.handle, .drag-handle, .ui-sortable-handle, [class*="handle" i], [class*="grip" i], .badge, .rank, .rank-number, .rank-pill')) return false;
+                const rect = el.getBoundingClientRect();
+                const isVisible = (rect.width > 0 && rect.height > 0) || (el.offsetParent !== null);
+                if (!isVisible) return false;
                 const txt = (el.innerText || el.textContent || '').trim();
-                return txt.length > 0 && !el.matches('.handle, .drag-handle');
+                return txt.length > 0;
             });
 
-            const items = allItems.map((el, idx) => {
+            // Filter out nested duplicates so only top-level cards are identified
+            const topLevelItems = allItems.filter(el => !allItems.some(other => other !== el && other.contains(el)));
+
+            const items = topLevelItems.map((el, idx) => {
                 const clone = el.cloneNode(true);
-                clone.querySelectorAll('.handle, .drag-handle, .ui-sortable-handle, [class*="handle" i]').forEach(h => h.remove());
-                const cleanText = clone.innerText.replace(/^\\d+[\\.\\s\\-:]+/, '').trim();
+                clone.querySelectorAll('.handle, .drag-handle, .ui-sortable-handle, [class*="handle" i], [class*="grip" i], button[aria-label*="reorder" i], svg').forEach(h => h.remove());
+                clone.querySelectorAll('.rank, .rank-number, .rank-pill, [class*="rank" i], .badge').forEach(r => r.remove());
+                let cleanText = clone.innerText.replace(/^\\d+[\\.\\s\\-:]+/, '').trim();
+                if (!cleanText) cleanText = el.innerText.trim() || `Item ${idx + 1}`;
                 const rect = el.getBoundingClientRect();
                 el.setAttribute('data-copilot-item-id', String(idx + 1));
+
+                const handle = el.querySelector('.handle, .drag-handle, .ui-sortable-handle, [class*="handle" i], [class*="grip" i], button[aria-label*="reorder" i], svg');
+                if (handle) {
+                    handle.setAttribute('data-copilot-handle-id', `handle_${idx + 1}`);
+                }
+
                 return {
                     id: String(idx + 1),
                     label: cleanText || `Item ${idx + 1}`,
                     selector: `[data-copilot-item-id="${idx + 1}"]`,
+                    handle_selector: handle ? `[data-copilot-handle-id="handle_${idx + 1}"]` : null,
                     index: idx + 1,
                     bounding_box: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
                 };
@@ -767,7 +782,10 @@ class RankingHandler(WidgetHandler):
 
             // 2. Drop Targets / Buckets / Slots
             let dropzones = [];
-            const dzEls = Array.from(document.querySelectorAll('.Group.Ranked, .dropzone, [data-widget="dropzone"], ul.Ranked, .target-bucket, .bucket, .drop-target, [aria-dropeffect]')).filter(el => el.offsetParent !== null);
+            const dzEls = Array.from(document.querySelectorAll('.Group.Ranked, .dropzone, [data-widget="dropzone"], ul.Ranked, .target-bucket, .bucket, .drop-target, [aria-dropeffect]')).filter(el => {
+                const rect = el.getBoundingClientRect();
+                return (rect.width > 0 && rect.height > 0) || (el.offsetParent !== null);
+            });
             
             if (dzEls.length > 0) {
                 dropzones = dzEls.map((dz, idx) => {
@@ -804,15 +822,23 @@ class RankingHandler(WidgetHandler):
         start_t = time.time()
         ranked_items = value if isinstance(value, list) else [str(value)]
         target_drop_id = inspection.target_container_id
+        container_sel = f'[data-stillbot-id="{inspection.element_id}"]' if inspection.element_id else ""
         
         try:
             target_dropzone = None
             if target_drop_id:
                 target_dropzone = page.locator(f'[data-stillbot-id="{target_drop_id}"]').first
             if not target_dropzone or await target_dropzone.count() == 0:
-                dz = page.locator('.Group.Ranked, .dropzone, [data-widget="dropzone"], ul.Ranked').first
+                dz = page.locator('.Group.Ranked, .dropzone, [data-widget="dropzone"], ul.Ranked, .target-bucket').first
                 if await dz.count() > 0:
                     target_dropzone = dz
+
+            slot_sel = (
+                f'{container_sel} li, {container_sel} [draggable="true"], {container_sel} .sortable-item, '
+                f'{container_sel} [role="listitem"], .ui-sortable li, .ui-sortable [draggable="true"], '
+                f'.ui-sortable .sortable-item, .ui-sortable .rank-item, .question-container [role="listitem"], '
+                f'.ranking-container [role="listitem"]'
+            )
 
             for rank_idx, item_name in enumerate(ranked_items):
                 item_str = str(item_name).strip()
@@ -826,29 +852,35 @@ class RankingHandler(WidgetHandler):
                 if matched_id:
                     source_loc = page.locator(f'[data-stillbot-id="{matched_id}"]').first
                 if not source_loc or await source_loc.count() == 0:
-                    source_loc = page.locator(f'li:has-text("{item_str}"), [draggable="true"]:has-text("{item_str}"), .sortable-item:has-text("{item_str}"), .draggable-row:has-text("{item_str}"), .Selection:has-text("{item_str}"), .rank-item:has-text("{item_str}")').first
+                    source_loc = page.locator(
+                        f'li:has-text("{item_str}"), [draggable="true"]:has-text("{item_str}"), '
+                        f'.sortable-item:has-text("{item_str}"), .draggable-row:has-text("{item_str}"), '
+                        f'.Selection:has-text("{item_str}"), .rank-item:has-text("{item_str}"), '
+                        f'[role="listitem"]:has-text("{item_str}")'
+                    ).first
                     
                 if not source_loc or await source_loc.count() == 0:
                     continue
 
                 await source_loc.scroll_into_view_if_needed()
                 
-                slot_sel = (
-                    f'[data-stillbot-id="{inspection.element_id}"] li, [data-stillbot-id="{inspection.element_id}"] [draggable="true"], [data-stillbot-id="{inspection.element_id}"] .sortable-item, '
-                    f'.ui-sortable li, .ui-sortable [draggable="true"], .ui-sortable .sortable-item, .ui-sortable .rank-item'
-                )
-                
+                # Check for drag handle to ensure pointer events bind properly
+                handle_loc = source_loc.locator(
+                    '[data-stillbot-handle-id], [data-copilot-handle-id], [class*="handle" i], [class*="grip" i], button[aria-label*="reorder" i], svg'
+                ).first
+                drag_origin = handle_loc if (await handle_loc.count() > 0) else source_loc
+
                 if strategy == StrategyType.LOCATOR_DRAG:
                     if target_dropzone and await target_dropzone.count() > 0:
-                        await source_loc.drag_to(target_dropzone, timeout=4000)
+                        await drag_origin.drag_to(target_dropzone, timeout=4000)
                     else:
                         slot = page.locator(slot_sel).nth(rank_idx)
                         if await slot.count() > 0:
-                            await source_loc.drag_to(slot, timeout=4000)
+                            await drag_origin.drag_to(slot, timeout=4000)
                     await page.wait_for_timeout(300)
 
                 elif strategy == StrategyType.POINTER_GESTURE:
-                    s_box = await source_loc.bounding_box()
+                    s_box = await drag_origin.bounding_box()
                     t_box = None
                     if target_dropzone and await target_dropzone.count() > 0:
                         t_box = await target_dropzone.bounding_box()
@@ -861,15 +893,14 @@ class RankingHandler(WidgetHandler):
                         tx, ty = t_box["x"] + t_box["width"] / 2, t_box["y"] + t_box["height"] / 2
                         await page.mouse.move(sx, sy)
                         await page.mouse.down()
-                        for st in range(1, 8):
-                            await page.mouse.move(sx + (tx - sx) * (st / 8.0), sy + (ty - sy) * (st / 8.0))
+                        for st in range(1, 10):
+                            await page.mouse.move(sx + (tx - sx) * (st / 10.0), sy + (ty - sy) * (st / 10.0))
                             await page.wait_for_timeout(20)
                         await page.mouse.move(tx, ty)
                         await page.mouse.up()
                         await page.wait_for_timeout(300)
 
                 elif strategy == StrategyType.HTML5_SYNTHETIC_DRAG:
-                    # Synthetic HTML5 DragEvent sequence with DataTransfer
                     target_loc = target_dropzone if (target_dropzone and await target_dropzone.count() > 0) else page.locator(slot_sel).nth(rank_idx)
                     if await target_loc.count() > 0:
                         await page.evaluate("""({src, tgt}) => {
@@ -878,16 +909,17 @@ class RankingHandler(WidgetHandler):
                             ['dragenter', 'dragover', 'drop'].forEach(ev => tgt.dispatchEvent(new DragEvent(ev, { bubbles: true, cancelable: true, dataTransfer: dt })));
                             ['dragend'].forEach(ev => src.dispatchEvent(new DragEvent(ev, { bubbles: true, cancelable: true, dataTransfer: dt })));
                             return true;
-                        }""", {"src": await source_loc.element_handle(), "tgt": await target_loc.element_handle()})
+                        }""", {"src": await drag_origin.element_handle(), "tgt": await target_loc.element_handle()})
                         await page.wait_for_timeout(300)
 
                 elif strategy == StrategyType.KEYBOARD_REORDER:
                     try:
-                        await source_loc.focus()
+                        await drag_origin.focus()
                         await page.keyboard.press("Space")
-                        cur_idx = await source_loc.evaluate("""el => {
-                            const p = el.parentElement;
-                            return p ? Array.from(p.children).indexOf(el) : 0;
+                        cur_idx = await drag_origin.evaluate("""el => {
+                            const p = el.closest('li, [role="listitem"], .sortable-item') || el;
+                            const parent = p.parentElement;
+                            return parent ? Array.from(parent.children).indexOf(p) : 0;
                         }""")
                         delta = rank_idx - cur_idx
                         k = "ArrowDown" if delta > 0 else "ArrowUp"
@@ -919,13 +951,20 @@ class RankingHandler(WidgetHandler):
                 container = document.getElementById(data.realId);
             }
             if (!container) {
-                container = document.querySelector('.ui-sortable, [data-widget="ranking"], ul.sortable, .ranking-container');
+                container = document.querySelector('.QuestionOuter, .question-container, .ui-sortable, [data-widget="ranking"], ul.sortable, .ranking-container, [role="list"], .q-ranking, [class*="ranking" i]');
             }
             if (!container) return [];
-            const items = Array.from(container.querySelectorAll('li, [draggable="true"], .rank-item, .sortable-item, .draggable-row, .Selection, [data-choice-id]'));
-            return items.map(it => {
+            const itemSelectors = 'li, [draggable="true"], .rank-item, .sortable-item, .draggable-row, .Selection, [data-choice-id], [role="listitem"]';
+            const allItems = Array.from(container.querySelectorAll(itemSelectors)).filter(el => {
+                if (el.matches('.handle, .drag-handle, .ui-sortable-handle, [class*="handle" i], [class*="grip" i], .badge, .rank, .rank-number, .rank-pill')) return false;
+                const rect = el.getBoundingClientRect();
+                return (rect.width > 0 && rect.height > 0) || (el.offsetParent !== null);
+            });
+            const topLevel = allItems.filter(el => !allItems.some(other => other !== el && other.contains(el)));
+            return topLevel.map(it => {
                 const clone = it.cloneNode(true);
-                clone.querySelectorAll('.handle, .drag-handle, .ui-sortable-handle, [class*="handle" i]').forEach(h => h.remove());
+                clone.querySelectorAll('.handle, .drag-handle, .ui-sortable-handle, [class*="handle" i], [class*="grip" i], button[aria-label*="reorder" i], svg').forEach(h => h.remove());
+                clone.querySelectorAll('.rank, .rank-number, .rank-pill, [class*="rank" i], .badge').forEach(r => r.remove());
                 return clone.innerText.replace(/^\\d+[\\.\\s\\-:]+/, '').trim();
             }).filter(Boolean);
         }""", {"targetDropId": target_drop_id, "containerId": f_id, "realId": inspection.real_id})

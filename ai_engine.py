@@ -350,6 +350,16 @@ def _attempt_field_resolution_fallback(
             "reason": alt[1]
         }
 
+    # 6. Ranking default resolution: if field is a ranking widget and options exist
+    if (field.get("role") == "ranking" or field.get("type") == "ranking") and options:
+        return {
+            "value": list(options),
+            "confidence": 0.85,
+            "source": "inferred",
+            "status": "ANSWERED",
+            "reason": "Sequential ranking ordering inferred from available options"
+        }
+
     return None
 
 def check_and_sanitize_unsupported_personal_inference(

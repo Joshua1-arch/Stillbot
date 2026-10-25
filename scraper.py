@@ -520,20 +520,21 @@ async def scrape_frame(frame: Frame, frame_index: int = 0):
         });
 
         // 7. Ranking / Drag-and-Drop Question Detection
-        // Identifies Qualtrics rank order (.RO, .Ranking, .ChoiceStructure.ui-sortable),
-        // sortable lists, draggable items, and ranked choice questions.
-        const rankingContainers = document.querySelectorAll(`
+        // Universally identifies Qualtrics Simple & Classic Layout (.RO, .Ranking, .ChoiceStructure),
+        // pointer-driven handle cards, SurveyMonkey, SurveyJS, and ARIA sortable lists.
+        const candidateContainers = document.querySelectorAll(`
             .Ranking,
             .RO,
             .ChoiceStructure.ui-sortable,
             [data-widget="ranking"],
             .rank-order,
             .QuestionOuter.RO,
-            .QuestionOuter:has([draggable="true"]),
-            .QuestionOuter:has(.ui-sortable-handle),
-            .QuestionOuter:has(.drag-handle),
-            .cf-question:has([draggable="true"]),
-            .question:has([draggable="true"]),
+            .QuestionOuter,
+            .question-container,
+            .cf-question,
+            .question,
+            [role="region"],
+            fieldset,
             div[class*="ranking" i],
             ul[class*="ranking" i]
         `);
@@ -541,25 +542,38 @@ async def scrape_frame(frame: Frame, frame_index: int = 0):
         const processedRankContainers = new Set();
         let rankCounter = 0;
         
-        rankingContainers.forEach(rc => {
-            const containerEl = rc.closest('.QuestionOuter, .cf-question, .question, .question-container') || rc;
+        candidateContainers.forEach(rc => {
+            const containerEl = rc.closest('.QuestionOuter, .cf-question, .question, .question-container, [role="region"], fieldset') || rc;
             if (processedRankContainers.has(containerEl)) return;
-            processedRankContainers.add(containerEl);
             
             const rRect = containerEl.getBoundingClientRect();
             if (rRect.width === 0 && rRect.height === 0) return;
             
             // Extract question prompt
             let qPrompt = "";
-            const titleEl = containerEl.querySelector('.QuestionText, [class*="QuestionText" i], .question-title, [data-kind="field-label"], .cf-question__text, [role="heading"], legend, .title');
+            const titleEl = containerEl.querySelector('.QuestionText, [class*="QuestionText" i], .question-title, .question-text, [class*="question-text" i], [class*="prompt" i], [data-kind="field-label"], .cf-question__text, [role="heading"], legend, .title, h1, h2, h3, h4');
             if (titleEl) {
                 qPrompt = titleEl.innerText.trim();
             } else {
-                qPrompt = containerEl.innerText.split('\n')[0].trim();
+                const clone = containerEl.cloneNode(true);
+                clone.querySelectorAll('.validation-error, .error, .ValidationError, [class*="error" i], [class*="alert" i], [role="alert"]').forEach(e => e.remove());
+                const lines = clone.innerText.split('\n').map(l => l.trim()).filter(l => l.length > 2 && !l.startsWith('⊘'));
+                qPrompt = lines[0] || "Rank your choices";
             }
             if (!qPrompt) qPrompt = "Rank your choices";
+            const promptLower = qPrompt.toLowerCase();
             
-            // Draggable / Ranked items
+            // Check if this container is a genuine ranking question
+            const hasExplicitRankClass = containerEl.matches('.Ranking, .RO, [class*="ranking" i], [class*="rank-order" i], [class*="sortable" i], [data-widget="ranking"]') ||
+                                         containerEl.querySelector('.Ranking, .RO, [class*="ranking" i], [class*="rank-order" i], [class*="sortable" i], [data-widget="ranking"]') !== null;
+            const hasDragHandle = containerEl.querySelector('[class*="handle" i], [class*="grip" i], button[aria-label*="reorder" i], [aria-label*="drag" i], [aria-roledescription*="sort" i]') !== null;
+            const hasRankKeyword = ['rank', 'order your', 'top three', 'top 3', 'top two', 'top 2', 'top four', 'top 4', 'priorit', 'arrange', 'preference order'].some(k => promptLower.includes(k));
+            
+            if (!hasExplicitRankClass && !hasDragHandle && !hasRankKeyword) {
+                return;
+            }
+            
+            // Draggable / Ranked item selectors supporting standard and modern headless/custom layouts
             const itemSelectors = [
                 'li[draggable="true"]',
                 'div[draggable="true"]',
@@ -569,19 +583,43 @@ async def scrape_frame(frame: Frame, frame_index: int = 0):
                 '.draggable-row',
                 '.sortable-item',
                 'tr[draggable="true"]',
-                '[data-choice-id]'
+                '[data-choice-id]',
+                '[role="listitem"]',
+                '.ChoiceStructure > li',
+                '.ChoiceStructure > div',
+                '.choice-list > div',
+                '.rank-order-list > div',
+                '[class*="choice-item" i]',
+                '[class*="ranking-item" i]',
+                'div:has(> [class*="handle" i])',
+                'div:has(> [class*="grip" i])',
+                'div:has(> button[aria-label*="reorder" i])',
+                'li:has([class*="handle" i])'
             ];
             
             let itemEls = Array.from(containerEl.querySelectorAll(itemSelectors.join(', ')));
+            if (itemEls.length === 0) {
+                const innerList = containerEl.querySelector('ul, ol, [role="list"], .ChoiceStructure, .choice-list, .rank-order-list');
+                if (innerList && innerList.children.length > 0) {
+                    itemEls = Array.from(innerList.children);
+                }
+            }
+            
+            // Filter only visible, unique, valid choice items
             itemEls = itemEls.filter((el, idx, self) => {
+                if (el.matches('.handle, .drag-handle, .ui-sortable-handle, [class*="handle" i], svg, button')) return false;
                 const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                const txt = (el.innerText || el.textContent || '').trim();
                 return rect.width > 0 && rect.height > 0 &&
-                       window.getComputedStyle(el).display !== 'none' &&
-                       window.getComputedStyle(el).visibility !== 'hidden' &&
+                       style.display !== 'none' &&
+                       style.visibility !== 'hidden' &&
+                       txt.length > 0 &&
                        self.indexOf(el) === idx;
             });
             
             if (itemEls.length === 0) return;
+            processedRankContainers.add(containerEl);
             
             const rOptions = [];
             const rOptionMap = {};
@@ -591,17 +629,23 @@ async def scrape_frame(frame: Frame, frame_index: int = 0):
                 const itId = `stillbot_f${__FRAME_IDX__}_rank_${rankCounter}_${itIdx}`;
                 it.setAttribute('data-stillbot-id', itId);
                 
+                // Attach stable handle targeting if a handle child exists
+                const handleEl = it.querySelector('.handle, .drag-handle, .ui-sortable-handle, [class*="handle" i], [class*="grip" i], button[aria-label*="reorder" i], svg');
+                if (handleEl) {
+                    handleEl.setAttribute('data-stillbot-handle-id', `${itId}_handle`);
+                }
+                
                 let itLabel = "";
                 const labelSub = it.querySelector('.Label, [class*="Label" i], .label, .item-text, .rank-label, span:not(.handle):not(.drag-handle)');
                 if (labelSub && labelSub.innerText.trim()) {
                     itLabel = labelSub.innerText.trim();
                 } else {
                     const clone = it.cloneNode(true);
-                    const handles = clone.querySelectorAll('.handle, .drag-handle, .ui-sortable-handle, [class*="handle" i]');
-                    handles.forEach(h => h.remove());
+                    clone.querySelectorAll('.handle, .drag-handle, .ui-sortable-handle, [class*="handle" i], [class*="grip" i], button[aria-label*="reorder" i], svg').forEach(h => h.remove());
+                    clone.querySelectorAll('.rank, .rank-number, .rank-pill, [class*="rank" i], .badge').forEach(r => r.remove());
                     itLabel = clone.innerText.trim();
                 }
-                if (!itLabel) itLabel = `Choice ${itIdx + 1}`;
+                if (!itLabel) itLabel = it.innerText.trim() || `Choice ${itIdx + 1}`;
                 const itClean = itLabel.replace(/^\d+[\.\s\-:]+/, '').trim() || itLabel;
                 
                 rOptions.push(itClean);
@@ -614,7 +658,7 @@ async def scrape_frame(frame: Frame, frame_index: int = 0):
                 });
             });
             
-            // Check for target dropzone
+            // Check for target dropzone (dual-bucket ranking)
             const dropzoneEl = containerEl.querySelector('.Group.Ranked, .dropzone, [data-widget="dropzone"], ul.Ranked, .target-bucket');
             let targetDropId = "";
             if (dropzoneEl) {
@@ -622,31 +666,37 @@ async def scrape_frame(frame: Frame, frame_index: int = 0):
                 dropzoneEl.setAttribute('data-stillbot-id', targetDropId);
             }
             
-            let targetCount = null;
-            const promptLower = qPrompt.toLowerCase();
-            const topMatch = promptLower.match(/top\s+(three|3|two|2|four|4|five|5|one|1)/i);
-            if (topMatch) {
-                const wordMap = { 'one': 1, '1': 1, 'two': 2, '2': 2, 'three': 3, '3': 3, 'four': 4, '4': 4, 'five': 5, '5': 5 };
-                targetCount = wordMap[topMatch[1].toLowerCase()] || 3;
-            }
+            let isRequired = containerEl.innerText.includes('*') || containerEl.querySelector('.required, .req, [aria-label*="required" i]') !== null;
             
             const contKey = getStableContainerKey(containerEl, 'rank');
             const rankingId = `stillbot_f${__FRAME_IDX__}_rank_q_${rankCounter}`;
             containerEl.setAttribute('data-stillbot-id', rankingId);
             rankCounter++;
             
+            // Extract target count from prompt (e.g. "top three", "top 3")
+            let targetCount = itemEls.length;
+            const topNumMatch = qPrompt.match(/top\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten)/i);
+            if (topNumMatch) {
+                const wordMap = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10 };
+                const rawVal = topNumMatch[1].toLowerCase();
+                targetCount = wordMap[rawVal] || parseInt(rawVal, 10) || itemEls.length;
+            }
+
             results.push({
                 id: rankingId,
                 real_id: containerEl.id || '',
+                name: qPrompt,
                 role: 'ranking',
                 label: qPrompt,
                 type: 'ranking',
                 options: rOptions,
                 option_map: rOptionMap,
+                required: isRequired,
+                items: itemMeta,
                 item_elements: itemMeta,
-                target_container_id: targetDropId,
                 target_count: targetCount,
-                required: true,
+                target_drop_id: targetDropId,
+                target_container_id: targetDropId,
                 is_matrix: false,
                 container_key: contKey
             });
