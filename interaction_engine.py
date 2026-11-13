@@ -16,6 +16,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from playwright.async_api import Page, Locator
 from rapidfuzz import fuzz
 
+from candidate_resolution import resolve_candidates, detect_candidates, determine_field_expectation, is_respondent_age_question
+
 
 class WidgetType(str, Enum):
     """Centralized taxonomy of form and survey interactive controls."""
@@ -339,10 +341,30 @@ class TextNumericHandler(WidgetHandler):
         start_t = time.time()
         val_str = str(value) if value is not None else ""
         locator = page.locator(f'[data-stillbot-id="{inspection.element_id}"]').first
+
+        # Pre-interaction check: resolve or reject multi-value candidates for single-value textboxes
+        lbl_lower = (inspection.label or "").lower()
+        is_age_field = is_respondent_age_question(inspection.label, role=inspection.role)
+        exp_type = "numeric_single" if is_age_field else "text_single"
+        has_multi, cands = detect_candidates(value, expected_type=exp_type)
+        if has_multi:
+            res_c = resolve_candidates(value, {"role": "textbox", "label": inspection.label})
+            if res_c.is_resolved and res_c.resolved_value is not None:
+                val_str = str(res_c.resolved_value)
+            else:
+                return ExecutionAttempt(
+                    strategy=strategy,
+                    success=False,
+                    duration_ms=(time.time() - start_t) * 1000,
+                    error=f"Rejected invalid multi-value response '{value}' for single-value textbox '{inspection.label}'"
+                )
         
         try:
             if not await locator.count() > 0 and inspection.real_id:
-                locator = page.locator(f'#{inspection.real_id}').first
+                try:
+                    locator = page.locator(f'[id="{inspection.real_id}"]').first
+                except Exception:
+                    pass
                 
             if strategy == StrategyType.PLAYWRIGHT_FILL:
                 await locator.fill(val_str, force=True, timeout=2500)
@@ -388,8 +410,50 @@ class TextNumericHandler(WidgetHandler):
             
         exp_clean = _clean_str(expected_value)
         act_clean = _clean_str(dom_val)
-        if exp_clean == act_clean or (exp_clean in act_clean and len(exp_clean) > 3):
+
+        lbl_lower = (inspection.label or "").lower()
+        is_age_field = is_respondent_age_question(inspection.label, role=inspection.role)
+        is_numeric = is_age_field or inspection.widget_type == WidgetType.NUMERIC or exp_clean.isdigit()
+
+        # Concatenation detection for numeric fields (e.g. 22232425262728)
+        if is_numeric and act_clean.isdigit():
+            if is_age_field and len(act_clean) >= 4:
+                return VerificationResult(
+                    control_type="textbox",
+                    expected_state=expected_value,
+                    actual_state=dom_val,
+                    is_verified=False,
+                    failure_reason=f"DOM value '{dom_val}' appears to be concatenated multiple values"
+                )
+            if len(act_clean) >= 6 and len(act_clean) >= len(exp_clean) + 4:
+                return VerificationResult(
+                    control_type="textbox",
+                    expected_state=expected_value,
+                    actual_state=dom_val,
+                    is_verified=False,
+                    failure_reason=f"DOM value '{dom_val}' contains concatenated multi-values"
+                )
+
+        # Numeric normalized comparison
+        if is_numeric and exp_clean.isdigit() and act_clean.isdigit():
+            if int(exp_clean) == int(act_clean):
+                return VerificationResult(control_type="textbox", expected_state=expected_value, actual_state=dom_val, is_verified=True)
+            return VerificationResult(
+                control_type="textbox",
+                expected_state=expected_value,
+                actual_state=dom_val,
+                is_verified=False,
+                failure_reason=f"DOM numeric value '{dom_val}' != expected '{expected_value}'"
+            )
+
+        # Exact string match
+        if exp_clean == act_clean:
             return VerificationResult(control_type="textbox", expected_state=expected_value, actual_state=dom_val, is_verified=True)
+
+        # Substring match ONLY for long non-numeric text responses
+        if not is_numeric and len(exp_clean) > 5 and exp_clean in act_clean:
+            return VerificationResult(control_type="textbox", expected_state=expected_value, actual_state=dom_val, is_verified=True)
+
         return VerificationResult(control_type="textbox", expected_state=expected_value, actual_state=dom_val, is_verified=False, failure_reason=f"DOM value '{dom_val}' != expected '{expected_value}'")
 
 

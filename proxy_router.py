@@ -25,8 +25,11 @@ PROXY_POOLS = {
     # 500 Australia Residential Ports (10000-10499)
     "australia": _fmt_pool("PROXY_AUSTRALIA_AUTH", range(10000, 10500)),
     
-    # 50 New York Residential Ports (10000-10049)
-    "new york": _fmt_pool("PROXY_NEWYORK_AUTH", range(10000, 10050)),
+    # 100 New York Residential Ports (10000-10099)
+    "new york": _fmt_pool("PROXY_NEWYORK_AUTH", range(10000, 10100)),
+    
+    # 510 North Carolina Residential Ports (10000-10509)
+    "north carolina": _fmt_pool("PROXY_NORTHCAROLINA_AUTH", range(10000, 10510)),
     
     # 50 Florida Residential Ports (10000-10049)
     "florida": _fmt_pool("PROXY_FLORIDA_AUTH", range(10000, 10050)),
@@ -34,8 +37,8 @@ PROXY_POOLS = {
     # 50 Illinois Residential Ports (10000-10049)
     "illinois": _fmt_pool("PROXY_ILLINOIS_AUTH", range(10000, 10050)),
     
-    # 5 California Residential Ports (10000-10004)
-    "california": _fmt_pool("PROXY_CALIFORNIA_AUTH", range(10000, 10005)),
+    # 10 California Residential Ports (10000-10009)
+    "california": _fmt_pool("PROXY_CALIFORNIA_AUTH", range(10000, 10010)),
     
     # Single Dedicated Residential Ports (10000)
     "utah": _fmt_pool("PROXY_UTAH_AUTH", [10000]),
@@ -51,6 +54,14 @@ STATE_ALIASES = {
     "new york": "new york", "ny": "new york", "nyc": "new york", "new york city": "new york",
     "manhattan": "new york", "brooklyn": "new york", "queens": "new york", "bronx": "new york",
     "albany": "new york", "buffalo": "new york", "yonkers": "new york",
+    
+    # North Carolina
+    "north carolina": "north carolina", "nc": "north carolina", "charlotte": "north carolina",
+    "raleigh": "north carolina", "greensboro": "north carolina", "durham": "north carolina",
+    "winston-salem": "north carolina", "winston salem": "north carolina",
+    "fayetteville": "north carolina", "cary": "north carolina", "wilmington": "north carolina",
+    "asheville": "north carolina", "high point": "north carolina", "concord": "north carolina",
+    "gastonia": "north carolina", "greenville": "north carolina", "half moon": "north carolina",
     
     # Florida
     "florida": "florida", "fl": "florida", "miami": "florida", "orlando": "florida",
@@ -181,9 +192,9 @@ async def get_fast_verified_proxy_for_run(text: str = None, run_index: int = 0, 
     print(f"⚡ Fast-path proxy assigned: Port index {fallback_idx}")
     return fallback_proxy, state_label, {
         "ip": "Residential IP",
-        "city": "Dallas" if state_label == "Texas" else "New York" if state_label == "New York" else "Orlando" if state_label == "Florida" else "Chicago" if state_label == "Illinois" else "Los Angeles" if state_label == "California" else "Salt Lake City",
+        "city": "Charlotte" if state_label == "North Carolina" else "Dallas" if state_label == "Texas" else "New York" if state_label == "New York" else "Orlando" if state_label == "Florida" else "Chicago" if state_label == "Illinois" else "Los Angeles" if state_label == "California" else "Salt Lake City",
         "region": state_label,
-        "postal": "75201" if state_label == "Texas" else "10001" if state_label == "New York" else "32801" if state_label == "Florida" else "60601" if state_label == "Illinois" else "90001" if state_label == "California" else "84101",
+        "postal": "28202" if state_label == "North Carolina" else "75201" if state_label == "Texas" else "10001" if state_label == "New York" else "32801" if state_label == "Florida" else "60601" if state_label == "Illinois" else "90001" if state_label == "California" else "84101",
         "country": "US",
         "org": "Geonix Residential Broadband"
     }

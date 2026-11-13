@@ -204,6 +204,7 @@ class RemoteSessionInfo:
     widget_items: Dict[str, Any] = field(default_factory=dict)
     widget_targets: Dict[str, Any] = field(default_factory=dict)
     active_widget: Optional[Dict[str, Any]] = None
+    advance_seq: int = 0
 
     def __post_init__(self):
         # Default pause_event to set so unpaused runs execute without blocking
@@ -314,6 +315,7 @@ class RemoteSessionManager:
         info = cls.get_session_info(chat_id=chat_id, session_id=session_id)
         if info:
             info.state = "PAUSED_CO_PILOT"
+            info._last_advance_verified = False
             info.page_num = page_num
             info.last_active = time.time()
             try:
@@ -593,6 +595,163 @@ class RemoteSessionManager:
         }
 
     @classmethod
+    async def _execute_advance_action(
+        cls,
+        info: RemoteSessionInfo,
+        page: Page,
+        user_id: Optional[Union[str, int]] = None
+    ) -> Dict[str, Any]:
+        """
+        Shared continuation logic used by both the Next button and the resume command:
+        1. Unblocks pause event.
+        2. Locates and clicks Next/Submit/Advance button or presses Enter.
+        3. Polls and verifies DOM/URL state change or reports page validation errors.
+        4. Transitions state to RUNNING upon verified transition.
+        """
+        # Guard against duplicate concurrent execution: if another simultaneous action already transitioned
+        # this session's advance sequence while this call was waiting for lock, return verified transition.
+        if hasattr(info, "advance_seq") and info.advance_seq > 0 and getattr(info, "_last_advance_verified", False):
+            return {
+                "success": True,
+                "action": "advance",
+                "verified": True,
+                "message": "Automation already resumed by a concurrent command.",
+                "url": page.url
+            }
+
+        info.pause_event.set()
+
+        initial_url = page.url
+        initial_content = ""
+        try:
+            initial_content = await page.evaluate("document.body ? document.body.innerText.slice(0, 300) : ''")
+        except Exception:
+            pass
+
+        selectors = [
+            '#NextButton', 'button#NextButton', 'input#NextButton',
+            'button.NextButton', 'input.NextButton', '.NextButton', '.next-button', '.next-btn',
+            '.cf-navigation-next', 'button.cf-navigation-next', '.cf-navigation__button',
+            'button[type="submit"]', 'input[type="submit"]',
+            'button:has-text("Next page")', 'button:has-text("Next Page")',
+            'button:has-text("Next")', 'button:has-text("Continue")', 'button:has-text("Submit")',
+            'button:has-text("Proceed")', 'button:has-text("Start")',
+            '[data-action*="next" i]', '[data-action*="submit" i]', '[aria-label*="next" i]'
+        ]
+        clicked = False
+        clicked_selector = None
+        for sel in selectors:
+            loc = page.locator(sel).first
+            if await loc.count() > 0:
+                try:
+                    if await loc.is_visible():
+                        await loc.scroll_into_view_if_needed()
+                        await loc.click(timeout=3000)
+                        clicked = True
+                        clicked_selector = sel
+                        break
+                except Exception:
+                    continue
+
+        if not clicked:
+            await page.keyboard.press("Enter")
+            clicked_selector = "Enter_key"
+
+        # Verification loop: Check on-screen survey validation errors FIRST
+        transition_verified = False
+        validation_error_msg = None
+        poll_start = time.time()
+
+        while time.time() - poll_start < 3.5:
+            await page.wait_for_timeout(300)
+            if page.is_closed():
+                break
+
+            err_text = await page.evaluate("""() => {
+                const errSelectors = [
+                    '.error', '.ValidationError', '.error-message', '.cf-error',
+                    '[aria-invalid="true"]', '.has-error', '.survey-error'
+                ];
+                for (const sel of errSelectors) {
+                    const el = document.querySelector(sel);
+                    if (el && el.offsetParent !== null) {
+                        const txt = (el.innerText || el.textContent || '').trim();
+                        if (txt.length > 0 && txt.length < 200) return txt;
+                    }
+                }
+                return null;
+            }""")
+            if err_text:
+                validation_error_msg = err_text
+                transition_verified = False
+                break
+
+            current_url = page.url
+            if current_url != initial_url:
+                transition_verified = True
+                break
+
+            current_content = await page.evaluate("document.body ? document.body.innerText.slice(0, 300) : ''")
+            if current_content and current_content != initial_content:
+                transition_verified = True
+                break
+
+        info.last_active = time.time()
+        info.url = page.url
+
+        if transition_verified:
+            info.state = "RUNNING"
+            info.advance_seq = getattr(info, "advance_seq", 0) + 1
+            info._last_advance_verified = True
+            info.widget_items.clear()
+            info.widget_targets.clear()
+            info.active_widget = None
+            log_copilot_event(
+                "ACTION_RESULT",
+                chat_id=info.chat_id,
+                user_id=user_id,
+                session_id=info.session_id,
+                action="advance",
+                result="TRANSITION_VERIFIED",
+                url=page.url
+            )
+            return {
+                "success": True,
+                "action": "advance",
+                "verified": True,
+                "clicked_selector": clicked_selector,
+                "url": page.url
+            }
+        elif validation_error_msg:
+            log_copilot_event(
+                "ACTION_RESULT",
+                chat_id=info.chat_id,
+                user_id=user_id,
+                session_id=info.session_id,
+                action="advance",
+                result="VALIDATION_ERROR",
+                details={"error_msg": validation_error_msg}
+            )
+            return {
+                "success": False,
+                "error": f"Page validation error: '{validation_error_msg}'. Please answer required questions using /fill or /drag first."
+            }
+        else:
+            log_copilot_event(
+                "ACTION_RESULT",
+                chat_id=info.chat_id,
+                user_id=user_id,
+                session_id=info.session_id,
+                action="advance",
+                result="UNVERIFIED",
+                details={"clicked_selector": clicked_selector}
+            )
+            return {
+                "success": False,
+                "error": "Clicked Next, but no page transition occurred. An unanswered question or interactive widget requires completion. Use /snap or /items."
+            }
+
+    @classmethod
     async def dispatch_remote_action(
         cls,
         action_type: str,
@@ -711,17 +870,29 @@ class RemoteSessionManager:
 
                 elif action_type == "resume":
                     if info.state not in ["PAUSED_USER", "PAUSED_CO_PILOT"]:
-                        return {"success": True, "action": "resume", "state": info.state, "message": "Automation is not paused."}
-                    info.state = "RUNNING"
-                    info.pause_event.set()
-                    info.last_active = time.time()
-                    log_copilot_event("SESSION_RESUMED_BY_USER", chat_id=info.chat_id, session_id=info.session_id)
-                    return {
-                        "success": True,
-                        "action": "resume",
-                        "state": "RUNNING",
-                        "message": "Automation resumed."
-                    }
+                        return {
+                            "success": False,
+                            "action": "resume",
+                            "state": info.state,
+                            "error": f"Automation is currently {info.state.lower()} and not waiting for manual input."
+                        }
+
+                    if info.state == "PAUSED_USER":
+                        info.state = "RUNNING"
+                        info.pause_event.set()
+                        info.last_active = time.time()
+                        log_copilot_event("SESSION_RESUMED_BY_USER", chat_id=info.chat_id, session_id=info.session_id)
+                        return {
+                            "success": True,
+                            "action": "resume",
+                            "state": "RUNNING",
+                            "message": "Automation resumed."
+                        }
+
+                    # When PAUSED_CO_PILOT (waiting for manual input / next):
+                    # Trigger the exact same continuation logic that the existing Next button uses!
+                    # Call advance action on cls
+                    return await cls._execute_advance_action(info, page, user_id)
 
                 # ------------------------------------------------------------------
                 # 3. SNAPSHOT
@@ -1024,135 +1195,7 @@ class RemoteSessionManager:
                 # 8. ADVANCE (Next / Continue / Submit)
                 # ------------------------------------------------------------------
                 elif action_type in ["advance", "next", "continue", "submit"]:
-                    # Unblock any paused copilot loops
-                    info.pause_event.set()
-                    
-                    initial_url = page.url
-                    initial_content = ""
-                    try:
-                        initial_content = await page.evaluate("document.body ? document.body.innerText.slice(0, 300) : ''")
-                    except Exception:
-                        pass
-
-                    selectors = [
-                        '#NextButton', 'button#NextButton', 'input#NextButton',
-                        'button.NextButton', 'input.NextButton', '.NextButton', '.next-button', '.next-btn',
-                        '.cf-navigation-next', 'button.cf-navigation-next', '.cf-navigation__button',
-                        'button[type="submit"]', 'input[type="submit"]',
-                        'button:has-text("Next page")', 'button:has-text("Next Page")',
-                        'button:has-text("Next")', 'button:has-text("Continue")', 'button:has-text("Submit")',
-                        'button:has-text("Proceed")', 'button:has-text("Start")',
-                        '[data-action*="next" i]', '[data-action*="submit" i]', '[aria-label*="next" i]'
-                    ]
-                    clicked = False
-                    clicked_selector = None
-                    for sel in selectors:
-                        loc = page.locator(sel).first
-                        if await loc.count() > 0:
-                            try:
-                                if await loc.is_visible():
-                                    await loc.scroll_into_view_if_needed()
-                                    await loc.click(timeout=3000)
-                                    clicked = True
-                                    clicked_selector = sel
-                                    break
-                            except Exception:
-                                continue
-
-                    if not clicked:
-                        await page.keyboard.press("Enter")
-                        clicked_selector = "Enter_key"
-
-                    # Verification loop: Check on-screen survey validation errors FIRST
-                    transition_verified = False
-                    validation_error_msg = None
-                    poll_start = time.time()
-
-                    while time.time() - poll_start < 3.5:
-                        await page.wait_for_timeout(300)
-                        if page.is_closed():
-                            break
-
-                        err_text = await page.evaluate("""() => {
-                            const errSelectors = [
-                                '.error', '.ValidationError', '.error-message', '.cf-error',
-                                '[aria-invalid="true"]', '.has-error', '.survey-error'
-                            ];
-                            for (const sel of errSelectors) {
-                                const el = document.querySelector(sel);
-                                if (el && el.offsetParent !== null) {
-                                    const txt = (el.innerText || el.textContent || '').trim();
-                                    if (txt.length > 0 && txt.length < 200) return txt;
-                                }
-                            }
-                            return null;
-                        }""")
-                        if err_text:
-                            validation_error_msg = err_text
-                            transition_verified = False
-                            break
-
-                        current_url = page.url
-                        if current_url != initial_url:
-                            transition_verified = True
-                            break
-
-                        current_content = await page.evaluate("document.body ? document.body.innerText.slice(0, 300) : ''")
-                        if current_content and current_content != initial_content:
-                            transition_verified = True
-                            break
-
-                    info.last_active = time.time()
-                    info.url = page.url
-
-                    if transition_verified:
-                        info.widget_items.clear()
-                        info.widget_targets.clear()
-                        info.active_widget = None
-                        log_copilot_event(
-                            "ACTION_RESULT",
-                            chat_id=info.chat_id,
-                            user_id=user_id,
-                            session_id=info.session_id,
-                            action="advance",
-                            result="TRANSITION_VERIFIED",
-                            url=page.url
-                        )
-                        return {
-                            "success": True,
-                            "action": "advance",
-                            "verified": True,
-                            "clicked_selector": clicked_selector,
-                            "url": page.url
-                        }
-                    elif validation_error_msg:
-                        log_copilot_event(
-                            "ACTION_RESULT",
-                            chat_id=info.chat_id,
-                            user_id=user_id,
-                            session_id=info.session_id,
-                            action="advance",
-                            result="VALIDATION_ERROR",
-                            details={"error_msg": validation_error_msg}
-                        )
-                        return {
-                            "success": False,
-                            "error": f"Page validation error: '{validation_error_msg}'. Please answer required questions using /fill or /drag first."
-                        }
-                    else:
-                        log_copilot_event(
-                            "ACTION_RESULT",
-                            chat_id=info.chat_id,
-                            user_id=user_id,
-                            session_id=info.session_id,
-                            action="advance",
-                            result="UNVERIFIED",
-                            details={"clicked_selector": clicked_selector}
-                        )
-                        return {
-                            "success": False,
-                            "error": "Clicked Next, but no page transition occurred. An unanswered question or interactive widget requires completion. Use /snap or /items."
-                        }
+                    return await cls._execute_advance_action(info, page, user_id)
 
                 # ------------------------------------------------------------------
                 # 9. FILL (Text input filling)
@@ -1319,6 +1362,24 @@ class LocalDesktopInterventionProvider(HumanInterventionProvider):
             except Exception:
                 pass
 
+        chat_key = str(kwargs.get("chat_id") or getattr(page, "_chat_id", None) or "default")
+        session_id = f"session_local_{chat_key}_{page_num}"
+        info = RemoteSessionManager.get_session_info(chat_id=chat_key)
+        if not info:
+            info = RemoteSessionManager.register_session(
+                session_id=session_id,
+                page=page,
+                chat_id=chat_key,
+                page_num=page_num,
+                state="PAUSED_CO_PILOT"
+            )
+        else:
+            RemoteSessionManager.mark_session_paused(
+                chat_id=chat_key,
+                page_num=page_num,
+                reason=reason
+            )
+
         initial_url = page.url
         try:
             initial_html = await page.evaluate("document.body ? document.body.innerText.slice(0, 300) : ''")
@@ -1327,6 +1388,14 @@ class LocalDesktopInterventionProvider(HumanInterventionProvider):
 
         start_time = asyncio.get_event_loop().time()
         while True:
+            if info and info.is_stopping():
+                _safe_print("🛑 Session is stopping or cancelled. Exiting Co-Pilot wait.")
+                return False
+
+            if info and info.state == "PAUSED_USER":
+                await asyncio.sleep(0.5)
+                continue
+
             elapsed = asyncio.get_event_loop().time() - start_time
             if timeout_seconds and elapsed > timeout_seconds:
                 _safe_print(f"⏱️ Co-Pilot timeout ({timeout_seconds}s) reached on Page {page_num}.")
@@ -1347,6 +1416,8 @@ class LocalDesktopInterventionProvider(HumanInterventionProvider):
                 if current_url != initial_url:
                     _safe_print(f"🎉 URL change detected ({current_url})! User advanced the page.")
                     _safe_print("🚀 Co-Pilot: Resuming automated bot...")
+                    if info:
+                        RemoteSessionManager.mark_session_resumed(chat_id=chat_key, page_num=page_num + 1)
                     await page.wait_for_timeout(1000)
                     return True
 
@@ -1354,6 +1425,8 @@ class LocalDesktopInterventionProvider(HumanInterventionProvider):
                 if current_html and current_html != initial_html:
                     _safe_print("🎉 DOM transition detected! User advanced the page.")
                     _safe_print("🚀 Co-Pilot: Resuming automated bot...")
+                    if info:
+                        RemoteSessionManager.mark_session_resumed(chat_id=chat_key, page_num=page_num)
                     await page.wait_for_timeout(1000)
                     return True
             except Exception as e:
@@ -1478,7 +1551,7 @@ class RemoteCloudInterventionProvider(HumanInterventionProvider):
                     f"• 🔗 **Live Survey URL:** `{page.url}`\n"
                     f"{item_summary}\n\n"
                     f"📱 **Quick Remote Controls:**\n"
-                    f"  👉 `/next` — advance / submit\n"
+                    f"  👉 `/next` or `resume` / `continue` — advance / resume\n"
                     f"  👉 `/fill <text>` — fill input field\n"
                     f"  👉 `/items` — list interactive elements\n"
                     f"  👉 `/snap` — updated screenshot\n"

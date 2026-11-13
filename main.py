@@ -333,7 +333,22 @@ async def fill_field(page, field, answer, page_num=1, status_callback=None):
     if source == "gap":
         print(f"⚠️ [WARNING] Persona gap detected for '{name}'. AI failed to infer a value. Leaving empty.")
         val = ""
-    
+
+    # Answer-Type-Aware normalization & Candidate Resolution pre-check
+    from candidate_resolution import resolve_candidates, determine_field_expectation, detect_candidates
+    exp = determine_field_expectation(field)
+    if exp in ["numeric_single", "choice_single", "text_single"]:
+        has_multi, _ = detect_candidates(val, expected_type=exp)
+        if has_multi:
+            res_c = resolve_candidates(val, field)
+            if res_c.is_resolved and res_c.resolved_value is not None:
+                val = res_c.resolved_value
+                if isinstance(answer, dict):
+                    answer["value"] = val
+            else:
+                print(f"⚠️ Rejecting invalid multi-value response '{val}' for single-value field '{name}' before page interaction.")
+                return
+
     print(f"✍️ Filling [{role}] '{name}' with: {val}")
     
     # 0. Primary Universal Interaction Engine Dispatch
@@ -366,9 +381,12 @@ async def fill_field(page, field, answer, page_num=1, status_callback=None):
         if not locator or await locator.count() == 0:
             real_id = field.get("real_id")
             if real_id:
-                loc = page.locator(f'#{real_id}').first
-                if await loc.count() > 0:
-                    locator = loc
+                try:
+                    loc = page.locator(f'[id="{real_id}"]').first
+                    if await loc.count() > 0:
+                        locator = loc
+                except Exception:
+                    pass
 
         if not locator or await locator.count() == 0:
             f_name = field.get("name")
@@ -2482,8 +2500,13 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
                 # 5. Act (Universally Fill Fields)
                 run_ctx.transition_state(PageState.FILLING)
                 filled_count = 0
+                processed_page_field_keys = {f.get("fingerprint") or f.get("logical_id") or f.get("id") for f in fields}
+                field_fill_attempts = {}
+                field_last_err = {}
                 for f in fields:
                     f_id = f["id"]
+                    fp = f.get("fingerprint") or f.get("logical_id") or f_id
+                    field_fill_attempts[fp] = field_fill_attempts.get(fp, 0) + 1
                     if f_id in answers:
                         ans_obj = answers[f_id]
                         ans_val = ans_obj.get("value")
@@ -2500,12 +2523,12 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
                         if ans_val is not None and str(ans_val).strip() != "":
                             filled_count += 1
                             is_ok, live_val, err = await verify_control_state(page, f, ans_val)
-                            fp = f.get("fingerprint") or f.get("logical_id")
                             if fp:
                                 if is_ok:
                                     session_memory[f.get("label", "Unknown")] = live_val or ans_val
                                     run_ctx.mark_verified(fp, live_val)
                                 else:
+                                    field_last_err[fp] = err or "Verification failed"
                                     print(f"⚠️ Live state verification failed for '{f.get('label')}': {err}")
                                     run_ctx.mark_validation_failed(fp, err or "Verification failed")
                 run_ctx.transition_state(PageState.VERIFYING)
@@ -2555,14 +2578,24 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
                     
                     unfilled_new_fields = []
                     for rf in re_scraped_fields:
-                        rf_fp = rf.get("fingerprint")
-                        rf_lid = rf.get("logical_id")
-                        q_obj = run_ctx.question_inventory.get(rf_fp) or run_ctx.question_inventory.get(rf_lid)
-                        if not q_obj or q_obj.status != AnswerStatus.VERIFIED:
+                        rf_key = rf.get("fingerprint") or rf.get("logical_id") or rf.get("id")
+                        is_truly_new = (rf_key not in processed_page_field_keys)
+                        
+                        # Requirement 4: Only treat fields as newly revealed conditional fields if they were NOT already processed on this page
+                        if is_truly_new:
                             lbl_lower = (rf.get("label") or "").lower()
                             if re.search(r'\b(other|another|specify)\b', lbl_lower) and rf.get("role") in ["checkbox", "textbox"]:
                                 continue
                             unfilled_new_fields.append(rf)
+                            processed_page_field_keys.add(rf_key)
+                        else:
+                            # Existing field: do not refill indefinitely if verification already failed repeatedly
+                            q_obj = run_ctx.question_inventory.get(rf.get("fingerprint")) or run_ctx.question_inventory.get(rf.get("logical_id"))
+                            if q_obj and q_obj.status == AnswerStatus.VALIDATION_FAILED:
+                                attempts = field_fill_attempts.get(rf_key, 0)
+                                if attempts >= 2:
+                                    # Retry threshold reached; do not treat as conditional field or refill repeatedly
+                                    continue
                             
                     if not unfilled_new_fields:
                         break
@@ -2574,17 +2607,19 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
                         enforce_age_and_dob_consistency(unfilled_new_fields, new_answers, session_memory)
                         for nf in unfilled_new_fields:
                             n_id = nf["id"]
+                            n_fp = nf.get("fingerprint") or nf.get("logical_id") or n_id
+                            field_fill_attempts[n_fp] = field_fill_attempts.get(n_fp, 0) + 1
                             if n_id in new_answers:
                                 await fill_field(page, nf, new_answers[n_id])
                                 session_memory[nf.get("label", "Unknown")] = new_answers[n_id]["value"]
                                 filled_count += 1
                                 answers[n_id] = new_answers[n_id]
                                 is_ok, live_val, err = await verify_control_state(page, nf, new_answers[n_id]["value"])
-                                n_fp = nf.get("fingerprint") or nf.get("logical_id")
                                 if n_fp:
                                     if is_ok:
                                         run_ctx.mark_verified(n_fp, live_val)
                                     else:
+                                        field_last_err[n_fp] = err or "Verification failed"
                                         run_ctx.mark_validation_failed(n_fp, err or "Verification failed")
                         fields.extend([nf for nf in unfilled_new_fields if nf not in fields])
 
@@ -2607,6 +2642,38 @@ async def run_bot(target_url: str = None, instructions: str = None, proxy: str =
             await sync_live_dom_to_session_memory(page, session_memory)
             
             # 6. Navigate (Find and Click Next / Continue / Submit)
+            # Requirement 6: Prevent premature Next button attempts if any required or repeatedly failed fields remain unverified
+            unverified_blocking = []
+            for f in fields:
+                fid = f.get("id")
+                fp = f.get("fingerprint") or f.get("logical_id") or fid
+                q_obj = run_ctx.question_inventory.get(fp) if fp else None
+                is_req = f.get("required") or (q_obj and q_obj.required)
+                is_failed = q_obj and q_obj.status == AnswerStatus.VALIDATION_FAILED
+                if is_req and (not q_obj or q_obj.status != AnswerStatus.VERIFIED):
+                    unverified_blocking.append(f)
+                elif is_failed and field_fill_attempts.get(fp, 0) >= 2:
+                    unverified_blocking.append(f)
+
+            if unverified_blocking:
+                blocking_labels = [f.get("label", "Field") for f in unverified_blocking]
+                print(f"🛑 Cannot advance page {page_num}: {len(unverified_blocking)} required/failed field(s) unverified ({blocking_labels}). Engaging Co-Pilot...")
+                run_ctx.transition_state(PageState.HUMAN_REVIEW_REQUIRED, f"Cannot advance: fields unverified ({', '.join(blocking_labels[:3])})")
+                resumed = await wait_for_human_copilot(
+                    page, page_num,
+                    reason=f"The following required or failed question(s) could not be verified in the browser before advancing: {', '.join(blocking_labels[:3])}. Please check or complete them on screen.",
+                    status_callback=status_callback
+                )
+                if not resumed:
+                    exit_reason = "TIMED_OUT"
+                    run_ctx.transition_state(PageState.TIMED_OUT, f"Co-pilot timeout on advance block: {', '.join(blocking_labels[:3])}")
+                    break
+                else:
+                    consecutive_stuck_attempts = 0
+                    previous_fields_hash = None
+                    page_num += 1
+                    continue
+
             print("⏭️ Searching for Next/Submit button...")
             try:
                 target_btn = await find_advance_button(page)

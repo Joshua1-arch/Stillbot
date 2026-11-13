@@ -981,18 +981,27 @@ async def remote_pause_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await _send_copilot_response(update, text=f"⚠️ Command error: {e}")
 
 async def remote_resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Remote Cloud Co-Pilot command: resume paused automated survey execution."""
+    """Remote Cloud Co-Pilot command: resume paused automated survey execution or advance when waiting for input."""
     from run_mode import RemoteSessionManager, log_copilot_event
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id if update.effective_user else None
-    log_copilot_event("UPDATE_RECEIVED", chat_id=chat_id, user_id=user_id, command="/resume")
+    cmd_name = update.message.text.strip().split()[0] if update.message and update.message.text else "/resume"
+    log_copilot_event("UPDATE_RECEIVED", chat_id=chat_id, user_id=user_id, command=cmd_name)
 
     try:
         res = await RemoteSessionManager.dispatch_remote_action("resume", chat_id=chat_id, user_id=user_id)
-        msg = f"▶️ {res.get('message', 'Automation resumed.')}" if res.get("success") else f"⚠️ Resume note: {res.get('error')}"
+        if res.get("success"):
+            if res.get("action") == "advance":
+                new_url = res.get("url", "")
+                url_part = f"\n🔗 Current URL: `{new_url}`" if new_url else ""
+                msg = f"⚡ Clicked Next/Advance on the cloud browser! State transition verified.{url_part}"
+            else:
+                msg = f"▶️ {res.get('message', 'Automation resumed.')}"
+        else:
+            msg = f"⚠️ Resume note: {res.get('error')}"
         await _send_copilot_response(update, text=msg)
     except Exception as e:
-        log_copilot_event("COMMAND_EXCEPTION", chat_id=chat_id, user_id=user_id, command="/resume", error=str(e))
+        log_copilot_event("COMMAND_EXCEPTION", chat_id=chat_id, user_id=user_id, command=cmd_name, error=str(e))
         await _send_copilot_response(update, text=f"⚠️ Command error: {e}")
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1127,6 +1136,8 @@ def main():
     application.add_handler(CommandHandler("click", remote_click_command))
     application.add_handler(CommandHandler("pause", remote_pause_command))
     application.add_handler(CommandHandler("resume", remote_resume_command))
+    application.add_handler(CommandHandler("continue", remote_resume_command))
+    application.add_handler(MessageHandler(filters.Regex(re.compile(r"^(/resume|resume|continue)$", re.IGNORECASE)) & ~filters.COMMAND, remote_resume_command))
     application.add_handler(CallbackQueryHandler(handle_copilot_callback, pattern=r"^copilot_"))
     # -----------------------------
 

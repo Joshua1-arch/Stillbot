@@ -5,6 +5,8 @@ from enum import Enum
 from typing import Dict, List, Optional, Any, Tuple
 from pydantic import BaseModel, Field
 
+from candidate_resolution import resolve_candidates, detect_candidates, determine_field_expectation, is_respondent_age_question
+
 class PageState(str, Enum):
     INITIALISING = "INITIALISING"
     LOADING = "LOADING"
@@ -147,6 +149,27 @@ class InstructionPrecedence:
             return global_prefs[key_lower], "global_user_preference"
 
         return None, "default_agent_behavior"
+
+    @staticmethod
+    def classify_fact(val: Any) -> str:
+        """
+        Classifies respondent fact representation into:
+        - 'confirmed_single': Exact single scalar fact
+        - 'candidate_set': Multiple candidate choices (e.g. '22, 23, 24, 25, 26, 27, 28.', 'Male or Female')
+        - 'range': Numeric range (e.g. '22-28')
+        - 'choice_list': List of valid selections
+        """
+        if val is None:
+            return "empty"
+        if isinstance(val, (list, tuple, set)):
+            return "choice_list" if len(val) > 1 else "confirmed_single"
+        val_str = str(val).strip()
+        has_multi, cands = detect_candidates(val_str)
+        if has_multi:
+            if re.match(r'^\s*\d+\s*(?:-|–|—|to)\s*\d+\s*$', val_str):
+                return "range"
+            return "candidate_set"
+        return "confirmed_single"
 
 class RunContext(BaseModel):
     run_id: str
@@ -421,29 +444,26 @@ class RunContext(BaseModel):
         # 6. Gender (with strict word-boundary matching to prevent "male" matching "female")
         if "gender" in lbl_lower or "sex" in lbl_lower:
             val, src = InstructionPrecedence.resolve_fact("gender", self.confirmed_profile, self.user_instructions, self.global_preferences)
-            if val and q.options:
-                val_str = str(val).lower().strip()
-                # 1. Exact match
-                for opt in q.options:
-                    if val_str == opt.lower().strip():
-                        self.token_metrics["deterministic_hits"] += 1
-                        return opt, src
-                # 2. Word boundary match
-                for opt in q.options:
-                    if re.search(r'\b' + re.escape(val_str) + r'\b', opt.lower()):
-                        self.token_metrics["deterministic_hits"] += 1
-                        return opt, src
-            elif val:
-                self.token_metrics["deterministic_hits"] += 1
-                return val, src
+            if val is not None:
+                q_dict = q.model_dump()
+                res = resolve_candidates(val, q_dict, session_memory=None, user_instructions=self.user_instructions, confirmed_profile=self.confirmed_profile)
+                if res.is_resolved and res.resolved_value is not None:
+                    self.confirmed_profile["gender"] = res.resolved_value
+                    self.token_metrics["deterministic_hits"] += 1
+                    return res.resolved_value, f"{src}:{res.resolution_strategy}"
+                return None
 
         # 7. Age (strictly for respondent)
-        if re.search(r'\b(what is your age|how old are you|enter your age|your age|age)\b', lbl_lower):
-            if not any(k in lbl_lower for k in ["child", "children", "spouse", "partner", "direct report", "employee", "parent", "mother", "father", "son", "daughter"]):
-                val, src = InstructionPrecedence.resolve_fact("age", self.confirmed_profile, self.user_instructions, self.global_preferences)
-                if val:
+        if is_respondent_age_question(q.label, role=q.role, f_type=q.type):
+            val, src = InstructionPrecedence.resolve_fact("age", self.confirmed_profile, self.user_instructions, self.global_preferences)
+            if val is not None:
+                q_dict = q.model_dump()
+                res = resolve_candidates(val, q_dict, session_memory=None, user_instructions=self.user_instructions, confirmed_profile=self.confirmed_profile)
+                if res.is_resolved and res.resolved_value is not None:
+                    self.confirmed_profile["age"] = res.resolved_value
                     self.token_metrics["deterministic_hits"] += 1
-                    return val, src
+                    return res.resolved_value, f"{src}:{res.resolution_strategy}"
+                return None
 
         # 8. Desired Role / Job Title
         if any(k in lbl_lower for k in ["desired role", "job title", "target role", "role"]):
@@ -453,15 +473,13 @@ class RunContext(BaseModel):
                 val, src = InstructionPrecedence.resolve_fact(rk, self.confirmed_profile, self.user_instructions, self.global_preferences)
                 if val:
                     break
-            if val and q.options:
-                val_clean = str(val).lower().strip()
-                for opt in q.options:
-                    if val_clean == opt.lower().strip() or val_clean in opt.lower().strip():
-                        self.token_metrics["deterministic_hits"] += 1
-                        return opt, src
-            elif val:
-                self.token_metrics["deterministic_hits"] += 1
-                return val, src
+            if val is not None:
+                q_dict = q.model_dump()
+                res = resolve_candidates(val, q_dict, session_memory=None, user_instructions=self.user_instructions, confirmed_profile=self.confirmed_profile)
+                if res.is_resolved and res.resolved_value is not None:
+                    self.token_metrics["deterministic_hits"] += 1
+                    return res.resolved_value, f"{src}:{res.resolution_strategy}"
+                return None
 
         # 9. Relocation willingness
         if any(k in lbl_lower for k in ["relocate", "relocation"]):

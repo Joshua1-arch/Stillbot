@@ -8,6 +8,7 @@ from openai import AsyncOpenAI
 from rapidfuzz import process, fuzz
 import config
 from run_context import RunContext, NormalizedQuestion
+from candidate_resolution import resolve_candidates, determine_field_expectation, detect_candidates, is_respondent_age_question
 
 # Initialize OpenAI Client to use Lily (Poolot) with bounded timeout
 client = AsyncOpenAI(api_key=config.LILY_API_KEY, base_url="https://agent.poolot.com/v1", timeout=25.0)
@@ -48,7 +49,7 @@ def generate_dynamic_schema(fields: List[Dict]) -> type[BaseModel]:
             sub_model_name,
             value=(Optional[annotation], None),
             confidence=(float, Field(0.9, ge=0.0, le=1.0, description="Confidence score from 0.0 to 1.0")),
-            source=(Literal["persona", "instruction", "inferred", "deduced", "research", "permitted_alternative", "estimate", "unauthorized"], Field("deduced", description="Source of the answer.")),
+            source=(Literal["persona", "profile", "instruction", "inferred", "deduced", "research", "permitted_alternative", "estimate", "unauthorized"], Field("deduced", description="Source of the answer.")),
             status=(Literal["ANSWERED", "NEEDS_CLARIFICATION", "UNANSWERABLE", "SKIPPED", "INVALID", "answered", "inferred", "unanswered"], Field("ANSWERED", description="Status of the decision.")),
             reason=(str, Field("Contextual deduction based on established persona and memory.", description="Brief logical justification / deduction reason based on persona and session memory."))
         )
@@ -212,7 +213,8 @@ def resolve_public_fact_or_research(field: Dict, session_memory: dict = None) ->
         city_to_state = {
             "chicago": "Illinois", "dallas": "Texas", "houston": "Texas", "austin": "Texas",
             "orlando": "Florida", "miami": "Florida", "los angeles": "California", "san francisco": "California",
-            "salt lake city": "Utah", "new york": "New York", "philadelphia": "Pennsylvania"
+            "salt lake city": "Utah", "new york": "New York", "philadelphia": "Pennsylvania",
+            "charlotte": "North Carolina", "raleigh": "North Carolina", "durham": "North Carolina", "greensboro": "North Carolina"
         }
         if any(k in lbl_lower for k in ["state", "province", "region"]) and not any(k in lbl_lower for k in ["united states", "statement"]):
             for c_name, s_name in city_to_state.items():
@@ -363,11 +365,13 @@ def _attempt_field_resolution_fallback(
     # 7. Rating / Likert / Importance Matrix Scale Fallback Deduction
     role = field.get("role", "textbox")
     f_type = field.get("type", "text")
-    if options and (role == "radio" or f_type in ["radio", "scale", "matrix"]):
-        importance_opts = [o for o in options if any(k in o.lower() for k in ["important", "agree", "5", "4", "extremely", "very"])]
+    lbl_clean = lbl.lower()
+    is_rating_q = any(k in lbl_clean for k in ["rate", "how important", "how satisfied", "to what extent", "level of agreement", "scale of 1", "rating", "satisfaction"])
+    if is_rating_q and options and (role == "radio" or f_type in ["radio", "scale", "matrix"]):
+        importance_opts = [o for o in options if any(k in o.lower() for k in ["extremely important", "very important", "strongly agree", "agree", "satisfied"]) or re.match(r'^\s*[45](\s*[\/\-]\s*5)?\s*$', o.strip())]
         if importance_opts:
-            top_positive = [o for o in options if any(k in o.lower() for k in ["extremely important", "very important", "5", "4", "strongly agree", "agree"])]
-            chosen = top_positive[0] if top_positive else options[-1]
+            top_positive = [o for o in options if any(k in o.lower() for k in ["extremely important", "very important", "strongly agree", "agree"]) or re.match(r'^\s*5(\s*[\/\-]\s*5)?\s*$', o.strip())]
+            chosen = top_positive[0] if top_positive else importance_opts[-1]
             return {
                 "value": chosen,
                 "confidence": 0.85,
@@ -409,10 +413,9 @@ def check_and_sanitize_unsupported_personal_inference(
     elif any(k in lbl_lower for k in ["years of experience", "years in role", "years of work experience", "how many years have you"]):
         is_personal_q = True
         personal_type = "experience"
-    elif re.search(r'\b(what is your age|how old are you|enter your age|your age|age group|age)\b', lbl_lower):
-        if not any(k in lbl_lower for k in ["child", "children", "spouse", "partner", "employee", "parent", "mother", "father", "son", "daughter"]):
-            is_personal_q = True
-            personal_type = "age"
+    elif is_respondent_age_question(lbl_lower, role=field.get("role"), f_type=field.get("type")):
+        is_personal_q = True
+        personal_type = "age"
 
     if not is_personal_q:
         return ans
@@ -572,7 +575,29 @@ def validate_answer_set(
                             best = process.extractOne(val_clean, cand_options, scorer=fuzz.WRatio)
                             if best and best[1] >= 60:
                                 ans["value"] = best[0]
-                                
+
+        # 2b. Answer-Type-Aware Normalization & Candidate Resolution
+        user_inst = run_context.user_instructions if run_context else ""
+        conf_prof = run_context.confirmed_profile if run_context else None
+        res_cand = resolve_candidates(
+            ans.get("value"),
+            f,
+            session_memory=session_memory,
+            user_instructions=user_inst,
+            confirmed_profile=conf_prof
+        )
+        if res_cand.is_resolved and res_cand.resolved_value is not None:
+            ans["value"] = res_cand.resolved_value
+            ans["status"] = "ANSWERED"
+            if run_context and is_respondent_age_question(f.get("label") or "", role=role, f_type=f.get("type")):
+                run_context.confirmed_profile["age"] = res_cand.resolved_value
+        elif res_cand.requires_human_review:
+            if is_required:
+                ans["value"] = None
+                ans["status"] = "UNANSWERABLE"
+                ans["source"] = "unauthorized"
+                ans["reason"] = res_cand.reason
+
         # 3. Sanitize unsupported personal inferences / stereotyping
         ans = check_and_sanitize_unsupported_personal_inference(f, ans, run_context, session_memory, persona)
         validated[fid] = ans
@@ -582,10 +607,14 @@ def validate_answer_set(
         status_final = ans.get("status", "").upper()
         if is_required:
             if val_final is None or (isinstance(val_final, str) and not val_final.strip()) or status_final in ["UNANSWERABLE", "NEEDS_CLARIFICATION", "INVALID", "UNRESOLVED"]:
-                recovered = _attempt_field_resolution_fallback(f, run_context, session_memory, persona)
-                if recovered and recovered.get("value") is not None and str(recovered.get("value")).strip() != "" and recovered.get("status", "").upper() not in ["UNANSWERABLE", "NEEDS_CLARIFICATION", "INVALID", "UNRESOLVED"]:
-                    ans.update(recovered)
-                else:
+                if ans.get("source") != "unauthorized":
+                    recovered = _attempt_field_resolution_fallback(f, run_context, session_memory, persona)
+                    if recovered and recovered.get("value") is not None and str(recovered.get("value")).strip() != "" and recovered.get("status", "").upper() not in ["UNANSWERABLE", "NEEDS_CLARIFICATION", "INVALID", "UNRESOLVED"]:
+                        ans.update(recovered)
+                
+                final_val = ans.get("value")
+                final_stat = ans.get("status", "").upper()
+                if final_val is None or (isinstance(final_val, str) and not final_val.strip()) or final_stat in ["UNANSWERABLE", "NEEDS_CLARIFICATION", "INVALID", "UNRESOLVED"]:
                     is_complete = False
                     unresolved_required.append({
                         "id": fid,

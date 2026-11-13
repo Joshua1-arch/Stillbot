@@ -11,6 +11,8 @@ __pycache__/
 
 # Sensitive environment variables & secrets (Never commit API keys/passwords)
 .env
+proxies_*.txt
+proxies.txt
 
 # Images, screenshots, and visual run artifacts
 artifacts/
