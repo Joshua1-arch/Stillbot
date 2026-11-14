@@ -380,6 +380,54 @@ class TestCandidateResolutionAndMultiValueFields(unittest.IsolatedAsyncioTestCas
         self.assertIn(validated_2["q_comm_desc"]["value"], field_comm["options"])
         self.assertNotEqual(validated_2["q_comm_desc"]["value"], "A safe")
 
+    def test_K_language_preservation_and_leave_empty_instruction(self):
+        """
+        Test that negative instructions ('leave ... empty/blank') are deterministically resolved
+        to an empty string instead of hallucinating or copying other values, and start year is
+        properly extracted.
+        """
+        inst = (
+            "During which years did you live in this community? it must be 2000 and leave the section "
+            "with the present as empty. i repeat leave that section with present as empty, just fill the first one with 2000"
+        )
+        ctx = RunContext(run_id="test_years_and_empty", user_instructions=inst)
+
+        q_start = NormalizedQuestion(
+            id="q_start_yr",
+            role="textbox",
+            label="During which years did you live in this community? - Start year:",
+            required=True
+        )
+        q_end = NormalizedQuestion(
+            id="q_end_yr",
+            role="textbox",
+            label="During which years did you live in this community? - End Year (or present)",
+            required=False
+        )
+
+        det_start = ctx.resolve_deterministic_answer(q_start)
+        det_end = ctx.resolve_deterministic_answer(q_end)
+
+        self.assertIsNotNone(det_start, "Start year should be deterministically resolved from user instruction")
+        self.assertEqual(det_start[0], "2000")
+
+        self.assertIsNotNone(det_end, "End year negative instruction must be deterministically resolved")
+        self.assertEqual(det_end[0], "", "End year must be resolved to empty string when instructed to leave empty")
+
+        # Test validation and answer preservation
+        field_start = {"id": "q_start_yr", "role": "textbox", "label": "During which years did you live in this community? - Start year:"}
+        field_end = {"id": "q_end_yr", "role": "textbox", "label": "During which years did you live in this community? - End Year (or present)"}
+
+        answers = {
+            "q_start_yr": {"value": det_start[0], "confidence": 1.0, "source": "instruction", "status": "ANSWERED"},
+            "q_end_yr": {"value": det_end[0], "confidence": 1.0, "source": "instruction", "status": "ANSWERED"}
+        }
+
+        val_set, is_complete, _ = validate_answer_set([field_start, field_end], answers, run_context=ctx)
+        self.assertEqual(val_set["q_start_yr"]["value"], "2000")
+        self.assertEqual(val_set["q_end_yr"]["value"], "")
+        self.assertNotEqual(val_set["q_end_yr"]["value"], "2000", "End year must never be filled with 2000")
+
 
 if __name__ == "__main__":
     unittest.main()

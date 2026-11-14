@@ -476,15 +476,44 @@ async def fill_field(page, field, answer, page_num=1, status_callback=None):
         elif role in ["combobox", "listbox"]:
             val_clean = str(val).strip()
             
-            # Avoid triggering survey reloads if language is already set
-            if "language" in (field.get("label") or "").lower():
-                try:
-                    cur_lang = await locator.evaluate("el => el ? (el.options[el.selectedIndex]?.text || '') : ''")
-                    if cur_lang.lower().startswith(val_clean.lower()) or val_clean.lower() in cur_lang.lower():
-                        print(f"✅ Language already set to '{cur_lang}'. Skipping.")
+            # Avoid triggering survey reloads if language is already set, and prevent switching away from English
+            lbl_lower = (field.get("label") or "").lower()
+            fid_lower = (field.get("id") or "").lower()
+            freal_lower = (field.get("real_id") or "").lower()
+            is_lang_field = "language" in lbl_lower or any(k in fid_lower for k in ["q_lang", "languageselector"]) or any(k in freal_lower for k in ["q_lang", "languageselector"])
+            if is_lang_field:
+                user_req = str(getattr(page, "_user_instructions", "") or "").lower()
+                explicit_foreign = any(w in user_req for w in ["in spanish", "in hindi", "in french", "in german", "in chinese", "switch language to"])
+                if not explicit_foreign:
+                    try:
+                        cur_lang = await locator.evaluate("el => el ? (el.options[el.selectedIndex]?.text || '') : ''")
+                        if "english" in cur_lang.lower() or cur_lang == "" or "en" in cur_lang.lower():
+                            print(f"🔒 English survey language preserved. Skipping language selector change to '{val_clean}'.")
+                            return
+                        en_val = await locator.evaluate("""el => {
+                            if (!el || !el.options) return null;
+                            for (let opt of el.options) {
+                                if (opt.text.toLowerCase().includes('english') || opt.value.toLowerCase() === 'en') {
+                                    return opt.value;
+                                }
+                            }
+                            return null;
+                        }""")
+                        if en_val:
+                            await locator.select_option(value=en_val, timeout=2000)
+                            print(f"🔒 Restored survey language to English (value: {en_val}).")
+                            return
+                    except Exception:
+                        print(f"🔒 Guard: Skipping potential survey language switch to '{val_clean}'.")
                         return
-                except Exception:
-                    pass
+                else:
+                    try:
+                        cur_lang = await locator.evaluate("el => el ? (el.options[el.selectedIndex]?.text || '') : ''")
+                        if cur_lang.lower().startswith(val_clean.lower()) or val_clean.lower() in cur_lang.lower():
+                            print(f"✅ Language already set to '{cur_lang}'. Skipping.")
+                            return
+                    except Exception:
+                        pass
 
             # Check if this is a standard native <select>
             try:

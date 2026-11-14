@@ -157,8 +157,22 @@ async def scrape_frame(frame: Frame, frame_index: int = 0):
             // Skip security tokens, CSRF, and anti-bot verification inputs
             const elId = (el.id || '').toLowerCase();
             const elName = (el.name || '').toLowerCase();
+            const elClass = (el.className && typeof el.className === 'string' ? el.className : '').toLowerCase();
             const secTokens = ['sessionid', 'verisoul', 'recaptcha', 'hcaptcha', 'turnstile', 'csrf', '_token', '__viewstate', 'fingerprint', 'bot_check', 'honeypot'];
             if (secTokens.some(k => elId.includes(k) || elName.includes(k))) return;
+
+            // Skip survey UI language dropdowns / selectors (e.g. Qualtrics #Q_lang, #LanguageSelectorContainer, .LanguageSelector)
+            // These are page chrome / UI controls, not survey questions. Selecting options here triggers page reloads into foreign languages.
+            const isLangSelector = elId === 'q_lang' ||
+                                   elId === 'q_language' ||
+                                   elName === 'q_language' ||
+                                   elName === 'q_lang' ||
+                                   elId.includes('languageselector') || 
+                                   elClass.includes('languageselector') || 
+                                   elName.includes('languageselector') ||
+                                   el.hasAttribute('data-language-selector') ||
+                                   el.closest('#LanguageSelectorContainer, .LanguageSelectorContainer, [id*="LanguageSelector" i], [class*="LanguageSelector" i]') !== null;
+            if (isLangSelector) return;
             
             // 1. Accessible Name / Option Label Extraction
             let name = el.getAttribute('aria-label') || '';

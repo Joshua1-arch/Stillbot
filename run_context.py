@@ -119,6 +119,23 @@ class InstructionPrecedence:
         # 1. Current run explicit user instruction
         if user_instructions:
             for k_var in key_variants:
+                # Explicit instructions to leave this field empty / blank / unselected
+                gen_empty_pats = [
+                    r'\b(?:leave|keep)\s+(?:the\s+)?' + re.escape(k_var) + r'[^.\n]*?(?:as\s+)?(?:empty|blank)\b',
+                    r'\b(?:do\s+not|don\'t)\s+(?:fill|type|write|answer|enter)\s+(?:the\s+)?' + re.escape(k_var) + r'\b',
+                    r'\b' + re.escape(k_var) + r'\s*(?:as|=|:)\s*(?:empty|blank|none)\b'
+                ]
+                if k_var in ["end_year", "end year", "present"]:
+                    gen_empty_pats.extend([
+                        r'\b(?:leave|keep)\s+(?:the\s+)?(?:section\s+with\s+(?:the\s+)?)?(?:present|end\s*year|second\s*one)[^.\n]*?(?:as\s+)?(?:empty|blank)\b',
+                        r'\b(?:do\s+not|don\'t)\s+(?:fill|type|write|answer|enter)\s+(?:the\s+)?(?:section\s+with\s+(?:the\s+)?)?(?:present|end\s*year|second\s*one)\b',
+                        r'\b(?:present|end\s*year|second\s*one)\s*(?:as|=|:)\s*(?:empty|blank|none)\b',
+                        r'\b(?:leave|keep)\s+(?:it|that|this)\s+(?:as\s+)?(?:empty|blank)\b'
+                    ])
+                for ep in gen_empty_pats:
+                    if re.search(ep, user_instructions, re.IGNORECASE):
+                        return "", "survey_specific_instruction"
+
                 patterns = [
                     (r'\b(?:my\s+|target\s+|desired\s+|current\s+|preferred\s+)?' + re.escape(k_var) + r'\s*(?:is|=|:)\s*([A-Za-z0-9_\s,-]+?)(?:\.|$|,|\n)', 1),
                     (r'\b(?:set|use)\s+(?:target\s+|desired\s+|current\s+|preferred\s+)?' + re.escape(k_var) + r'\s*(?:to|=)?\s*([A-Za-z0-9_\s,-]+?)(?:\.|$|,|\n)', 1),
@@ -134,7 +151,13 @@ class InstructionPrecedence:
                     ])
                 elif k_var in ["city", "town"]:
                     patterns.extend([
-                        (r'\bin\s+([A-Za-z\s]+?),\s*(?:NC|North Carolina|[A-Z]{2})\b', 1)
+                        (r'\bin\s+([A-Za-z\s]+?),\s*(?:NC|North Carolina|[A-Z]{2})\b', 1),
+                        (r'\b(?:city|town)\s*(?:is|=|:)?\s*([A-Za-z\s]+?)(?:,|$|\.|\n)', 1),
+                        (r'\b([A-Za-z\s]+?),\s*(?:NC|North Carolina)\b', 1)
+                    ])
+                elif k_var in ["zip_code", "zip code", "postal_code", "postal code"]:
+                    patterns.extend([
+                        (r'\b(?:zip(?:\s*code)?|postal(?:\s*code)?)\s*(?:is|=|:)?\s*(\d{5}(?:-\d{4})?)\b', 1)
                     ])
                 elif k_var in ["state", "province", "region"]:
                     patterns.extend([
@@ -143,6 +166,9 @@ class InstructionPrecedence:
                     ])
                 elif k_var in ["start_year", "start year"]:
                     patterns.extend([
+                        (r'(?:during which years|years did you live|start year|first one)[^.\n]*?(?:must be|is|=|with)\s*(\d{4})\b', 1),
+                        (r'\bjust\s+fill\s+(?:the\s+)?(?:first\s+one\s+with\s+)?(\d{4})\b', 1),
+                        (r'\b(?:fill|set)\s+(?:the\s+)?first\s+(?:one\s+)?(?:with\s+)?(\d{4})\b', 1),
                         (r'\bstart\s*year\s*(?:is|=|:)?\s*(\d{4})\b', 1),
                         (r'\b(?:from|since)\s+(\d{4})\b', 1)
                     ])
@@ -575,6 +601,20 @@ class RunContext(BaseModel):
                 county_clean = str(val).strip().title()
                 self.token_metrics["deterministic_hits"] += 1
                 return county_clean, src
+            # Infer from ZIP code if available
+            zip_val, _ = InstructionPrecedence.resolve_fact("zip_code", self.confirmed_profile, self.user_instructions, self.global_preferences)
+            if not zip_val:
+                zip_val, _ = InstructionPrecedence.resolve_fact("postal_code", self.confirmed_profile, self.user_instructions, self.global_preferences)
+            nc_zip_map = {
+                "28540": "Onslow", "28546": "Onslow", "28541": "Onslow",
+                "27401": "Guilford", "27402": "Guilford", "27403": "Guilford",
+                "27601": "Wake", "27602": "Wake", "27603": "Wake",
+                "28202": "Mecklenburg", "28203": "Mecklenburg", "28204": "Mecklenburg"
+            }
+            if zip_val and str(zip_val).strip() in nc_zip_map:
+                c_name = nc_zip_map[str(zip_val).strip()]
+                self.token_metrics["deterministic_hits"] += 1
+                return c_name, "geographic_mapping"
 
         # 13. City / Town
         if any(k in lbl_lower for k in ["city or town", "city / town", "what city", "your city", "town"]):
@@ -595,18 +635,18 @@ class RunContext(BaseModel):
         # 15. Start Year / Beginning Year
         if any(k in lbl_lower for k in ["start year", "year started", "beginning year", "start year:"]):
             val, src = InstructionPrecedence.resolve_fact("start_year", self.confirmed_profile, self.user_instructions, self.global_preferences)
-            if not val:
+            if val is None:
                 val, src = InstructionPrecedence.resolve_fact("start year", self.confirmed_profile, self.user_instructions, self.global_preferences)
-            if val:
+            if val is not None:
                 self.token_metrics["deterministic_hits"] += 1
                 return str(val).strip(), src
 
         # 16. End Year
         if any(k in lbl_lower for k in ["end year", "year ended", "end year (or present)", "until year"]):
             val, src = InstructionPrecedence.resolve_fact("end_year", self.confirmed_profile, self.user_instructions, self.global_preferences)
-            if not val:
+            if val is None:
                 val, src = InstructionPrecedence.resolve_fact("end year", self.confirmed_profile, self.user_instructions, self.global_preferences)
-            if val:
+            if val is not None:
                 self.token_metrics["deterministic_hits"] += 1
                 return str(val).strip(), src
 
