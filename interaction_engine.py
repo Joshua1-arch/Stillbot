@@ -531,29 +531,42 @@ class ChoiceHandler(WidgetHandler):
 
         try:
             for t_id in target_ids:
-                if strategy == StrategyType.NATIVE_CLICK:
+                clicked = False
+                if strategy in [StrategyType.LABEL_CLICK, StrategyType.NATIVE_CLICK]:
+                    real_id = await page.evaluate(f"""(id) => {{
+                        {DOM_SHADOW_HELPER_JS}
+                        const el = findInDomOrShadow(id, null);
+                        return el ? el.id : null;
+                    }}""", t_id)
+                    if real_id:
+                        lbl = page.locator(f'label[for="{CSS.escape(real_id)}"]:visible, .enhancedchoice label[for="{CSS.escape(real_id)}"]').first
+                        if await lbl.count() > 0:
+                            await lbl.click(force=True, timeout=2000)
+                            clicked = True
+
+                if not clicked and strategy in [StrategyType.NATIVE_CLICK, StrategyType.LABEL_CLICK]:
                     loc = page.locator(f'[data-stillbot-id="{t_id}"]').first
                     if await loc.count() > 0:
-                        await loc.click(force=True, timeout=2000)
-                elif strategy == StrategyType.LABEL_CLICK:
-                    lbl = page.locator(f'label:has([data-stillbot-id="{t_id}"]), label[for="{t_id}"]').first
-                    if await lbl.count() > 0:
-                        await lbl.click(force=True, timeout=2000)
-                    else:
-                        loc = page.locator(f'[data-stillbot-id="{t_id}"]').first
-                        await loc.click(force=True, timeout=2000)
-                elif strategy == StrategyType.DOM_EVENT_DISPATCH:
-                    await page.evaluate("""(id) => {
-                        const el = document.querySelector(`[data-stillbot-id="${id}"]`);
+                        try:
+                            await loc.click(force=True, timeout=1500)
+                            clicked = True
+                        except Exception:
+                            pass
+
+                if not clicked or strategy == StrategyType.DOM_EVENT_DISPATCH:
+                    await page.evaluate(f"""(id) => {{
+                        {DOM_SHADOW_HELPER_JS}
+                        const el = findInDomOrShadow(id, null);
                         if (!el) return;
-                        el.click();
+                        const clickable = el.closest('td, label, .ChoiceStructure, [role="radio"], .Selection, .q-radio') || el;
+                        clickable.click();
                         el.checked = true;
-                        if (el.getAttribute('role') === 'radio' || el.getAttribute('role') === 'checkbox') {
+                        if (el.getAttribute('role') === 'radio' || el.getAttribute('role') === 'checkbox') {{
                             el.setAttribute('aria-checked', 'true');
-                        }
-                        el.dispatchEvent(new Event('input', { bubbles: true }));
-                        el.dispatchEvent(new Event('change', { bubbles: true }));
-                    }""", t_id)
+                        }}
+                        el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                        el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    }}""", t_id)
             return ExecutionAttempt(strategy=strategy, success=True, duration_ms=(time.time() - start_t) * 1000)
         except Exception as e:
             return ExecutionAttempt(strategy=strategy, success=False, duration_ms=(time.time() - start_t) * 1000, error=str(e))
@@ -1291,21 +1304,38 @@ class MatrixHandler(WidgetHandler):
             target_id = inspection.element_id
 
         try:
-            if strategy == StrategyType.NATIVE_CLICK:
+            clicked = False
+            # 1. Label click via real element ID
+            if strategy in [StrategyType.LABEL_CLICK, StrategyType.NATIVE_CLICK]:
+                real_id = await page.evaluate(f"""(id) => {{
+                    {DOM_SHADOW_HELPER_JS}
+                    const el = findInDomOrShadow(id, null);
+                    return el ? el.id : null;
+                }}""", target_id)
+                if real_id:
+                    lbl = page.locator(f'label[for="{CSS.escape(real_id)}"]:visible, .enhancedchoice label[for="{CSS.escape(real_id)}"]').first
+                    if await lbl.count() > 0:
+                        await lbl.click(force=True, timeout=2000)
+                        clicked = True
+
+            # 2. Native click on container cell or locator
+            if not clicked and strategy in [StrategyType.NATIVE_CLICK, StrategyType.LABEL_CLICK]:
                 loc = page.locator(f'[data-stillbot-id="{target_id}"]').first
-                await loc.click(force=True, timeout=2000)
-            elif strategy == StrategyType.LABEL_CLICK:
-                lbl = page.locator(f'label:has([data-stillbot-id="{target_id}"]), label[for="{target_id}"]').first
-                if await lbl.count() > 0:
-                    await lbl.click(force=True, timeout=2000)
-                else:
-                    await page.locator(f'[data-stillbot-id="{target_id}"]').first.click(force=True, timeout=2000)
-            elif strategy == StrategyType.DOM_EVENT_DISPATCH:
+                if await loc.count() > 0:
+                    try:
+                        await loc.click(force=True, timeout=1500)
+                        clicked = True
+                    except Exception:
+                        pass
+
+            # 3. DOM Event Dispatch & Click fallback
+            if not clicked or strategy == StrategyType.DOM_EVENT_DISPATCH:
                 await page.evaluate(f"""(id) => {{
                     {DOM_SHADOW_HELPER_JS}
                     const el = findInDomOrShadow(id, null);
                     if (!el) return;
-                    el.click();
+                    const clickable = el.closest('td, label, .ChoiceStructure, [role="radio"], .q-radio, .Selection') || el;
+                    clickable.click();
                     el.checked = true;
                     if (el.getAttribute('role') === 'radio' || el.getAttribute('role') === 'checkbox') {{
                         el.setAttribute('aria-checked', 'true');
@@ -1325,10 +1355,23 @@ class MatrixHandler(WidgetHandler):
                 if (!el) continue;
                 const isChecked = el.checked === true || 
                                  el.getAttribute('aria-checked') === 'true' || 
+                                 el.classList.contains('q-checked') || 
                                  el.classList.contains('selected') || 
                                  el.classList.contains('checked');
                 if (isChecked) {{
-                    return {{ id: id, value: el.value || '' }};
+                    return {{ id: id, value: el.value || el.innerText || '' }};
+                }}
+                const parent = el.closest('td, li, label, .ChoiceStructure, [role="radio"], .Selection, .ControlContainer');
+                if (parent) {{
+                    const parentChecked = parent.classList.contains('q-checked') || 
+                                          parent.classList.contains('Selected') || 
+                                          parent.classList.contains('checked') || 
+                                          parent.classList.contains('q-radio-active') || 
+                                          parent.getAttribute('aria-checked') === 'true' || 
+                                          parent.querySelector('.q-checked, .checked, .Selected, [aria-checked="true"], input:checked');
+                    if (parentChecked) {{
+                        return {{ id: id, value: el.value || el.innerText || '' }};
+                    }}
                 }}
             }}
             return null;
@@ -1391,14 +1434,14 @@ class UniversalInteractionRegistry:
     def __init__(self):
         self.handlers: List[WidgetHandler] = [
             TextNumericHandler(),
+            MatrixHandler(),
             ChoiceHandler(),
             DropdownHandler(),
             RankingHandler(),
             SliderHandler(),
             DateTimeHandler(),
             FileUploadHandler(),
-            SignaturePadHandler(),
-            MatrixHandler()
+            SignaturePadHandler()
         ]
         self.knowledge_base = StrategyKnowledgeBase()
 

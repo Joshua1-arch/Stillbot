@@ -121,13 +121,42 @@ class InstructionPrecedence:
             for k_var in key_variants:
                 patterns = [
                     (r'\b(?:my\s+|target\s+|desired\s+|current\s+|preferred\s+)?' + re.escape(k_var) + r'\s*(?:is|=|:)\s*([A-Za-z0-9_\s,-]+?)(?:\.|$|,|\n)', 1),
-                    (r'\b(?:set|use)\s+(?:target\s+|desired\s+|current\s+|preferred\s+)?' + re.escape(k_var) + r'\s*(?:to|=)?\s*([A-Za-z0-9_\s,-]+?)(?:\.|$|,|\n)', 1)
+                    (r'\b(?:set|use)\s+(?:target\s+|desired\s+|current\s+|preferred\s+)?' + re.escape(k_var) + r'\s*(?:to|=)?\s*([A-Za-z0-9_\s,-]+?)(?:\.|$|,|\n)', 1),
+                    (r'•\s*' + re.escape(k_var) + r'\s*:\s*([A-Za-z0-9_\s,-]+?)(?:\.|$|,|\n)', 1),
+                    (r'\b(?:asking for\s+)?' + re.escape(k_var) + r'(?:[,\s]+you\s+must\s+(?:select\s+or\s+write|write|select|enter|use)\s*[:=]?\s*|\s*[:=]\s*)([A-Za-z0-9_\s,-]+?)(?:\.|$|,|\n)', 1),
+                    (r'\b(?:for\s+any\s+question\s+asking\s+for\s+)?' + re.escape(k_var) + r'[,:\s]+you\s+must\s+(?:select\s+or\s+write|write|select|enter|use)\s*[:=]?\s*([A-Za-z0-9_\s,-]+?)(?:\.|$|,|\n)', 1)
                 ]
+                if k_var == "county":
+                    patterns.extend([
+                        (r'\b([A-Za-z]+)\s+county\b', 1),
+                        (r'\bcounty\s+(?:of\s+)?([A-Za-z]+)\b', 1),
+                        (r'\bcounty\s*(?:is|=|:)?\s*([A-Za-z]+)\b', 1)
+                    ])
+                elif k_var in ["city", "town"]:
+                    patterns.extend([
+                        (r'\bin\s+([A-Za-z\s]+?),\s*(?:NC|North Carolina|[A-Z]{2})\b', 1)
+                    ])
+                elif k_var in ["state", "province", "region"]:
+                    patterns.extend([
+                        (r'•\s*State\s*(?:/\s*Region\s*/\s*Province)?\s*:\s*([A-Za-z0-9_\s,-]+?)(?:\.|$|,|\n)', 1),
+                        (r'\b(?:State|Province|Region)[,:\s]+(?:you\s+must\s+(?:select\s+or\s+write|write|select|enter|use)\s*[:=]?\s*|\s*[:=]\s*)([A-Za-z0-9_\s,-]+?)(?:\.|$|,|\n)', 1)
+                    ])
+                elif k_var in ["start_year", "start year"]:
+                    patterns.extend([
+                        (r'\bstart\s*year\s*(?:is|=|:)?\s*(\d{4})\b', 1),
+                        (r'\b(?:from|since)\s+(\d{4})\b', 1)
+                    ])
+                elif k_var in ["end_year", "end year"]:
+                    patterns.extend([
+                        (r'\bend\s*year\s*(?:is|=|:)?\s*(\d{4}|present)\b', 1),
+                        (r'\b(?:to|-|until)\s*(\d{4}|present)\b', 1)
+                    ])
                 for pat, group in patterns:
                     m = re.search(pat, user_instructions, re.IGNORECASE)
                     if m:
                         val = m.group(group).strip()
-                        return val, "survey_specific_instruction"
+                        if val:
+                            return val, "survey_specific_instruction"
 
         # 2. Confirmed respondent facts
         if confirmed_profile:
@@ -387,12 +416,28 @@ class RunContext(BaseModel):
                     unverified_required.append(q)
         return len(unverified_required) == 0, unverified_required
 
-    def resolve_deterministic_answer(self, q: NormalizedQuestion) -> Optional[Tuple[Any, str]]:
+    def resolve_deterministic_answer(self, q: Any) -> Optional[Tuple[Any, str]]:
         """
         Attempts to resolve an answer deterministically from verified profile/instructions
         before calling the AI. Uses word boundaries to avoid false substring matches.
+        Accepts NormalizedQuestion or dict representations of fields.
         """
-        lbl_lower = q.label.lower()
+        if hasattr(q, "model_dump"):
+            q_dict = q.model_dump()
+            lbl = q.label or ""
+            role = q.role or ""
+            f_type = getattr(q, "type", "")
+            options = q.options or []
+        elif isinstance(q, dict):
+            q_dict = q
+            lbl = q.get("label", "")
+            role = q.get("role", "")
+            f_type = q.get("type", "")
+            options = q.get("options", [])
+        else:
+            return None
+
+        lbl_lower = lbl.lower()
         
         # 1. Exact Email matching
         if any(k in lbl_lower for k in ["email address", "e-mail", "email"]):
@@ -445,7 +490,6 @@ class RunContext(BaseModel):
         if "gender" in lbl_lower or "sex" in lbl_lower:
             val, src = InstructionPrecedence.resolve_fact("gender", self.confirmed_profile, self.user_instructions, self.global_preferences)
             if val is not None:
-                q_dict = q.model_dump()
                 res = resolve_candidates(val, q_dict, session_memory=None, user_instructions=self.user_instructions, confirmed_profile=self.confirmed_profile)
                 if res.is_resolved and res.resolved_value is not None:
                     self.confirmed_profile["gender"] = res.resolved_value
@@ -454,10 +498,9 @@ class RunContext(BaseModel):
                 return None
 
         # 7. Age (strictly for respondent)
-        if is_respondent_age_question(q.label, role=q.role, f_type=q.type):
+        if is_respondent_age_question(lbl, role=role, f_type=f_type):
             val, src = InstructionPrecedence.resolve_fact("age", self.confirmed_profile, self.user_instructions, self.global_preferences)
             if val is not None:
-                q_dict = q.model_dump()
                 res = resolve_candidates(val, q_dict, session_memory=None, user_instructions=self.user_instructions, confirmed_profile=self.confirmed_profile)
                 if res.is_resolved and res.resolved_value is not None:
                     self.confirmed_profile["age"] = res.resolved_value
@@ -474,7 +517,6 @@ class RunContext(BaseModel):
                 if val:
                     break
             if val is not None:
-                q_dict = q.model_dump()
                 res = resolve_candidates(val, q_dict, session_memory=None, user_instructions=self.user_instructions, confirmed_profile=self.confirmed_profile)
                 if res.is_resolved and res.resolved_value is not None:
                     self.token_metrics["deterministic_hits"] += 1
@@ -486,9 +528,9 @@ class RunContext(BaseModel):
             val, src = InstructionPrecedence.resolve_fact("will you relocate", self.confirmed_profile, self.user_instructions, self.global_preferences)
             if not val:
                 val, src = InstructionPrecedence.resolve_fact("relocate", self.confirmed_profile, self.user_instructions, self.global_preferences)
-            if val and q.options:
+            if val and options:
                 val_str = str(val).lower().strip()
-                for opt in q.options:
+                for opt in options:
                     if val_str in opt.lower().strip() or opt.lower().strip() in val_str:
                         self.token_metrics["deterministic_hits"] += 1
                         return opt, src
@@ -500,9 +542,9 @@ class RunContext(BaseModel):
         if any(k in lbl_lower for k in ["country of residence", "what country", "your country", "country"]):
             if not any(k in lbl_lower for k in ["cross country", "country music"]):
                 val, src = InstructionPrecedence.resolve_fact("country", self.confirmed_profile, self.user_instructions, self.global_preferences)
-                if val and q.options:
+                if val and options:
                     val_str = str(val).lower().strip()
-                    for opt in q.options:
+                    for opt in options:
                         if val_str == opt.lower().strip() or val_str in opt.lower().strip():
                             self.token_metrics["deterministic_hits"] += 1
                             return opt, src
@@ -516,14 +558,56 @@ class RunContext(BaseModel):
                 val, src = InstructionPrecedence.resolve_fact("education", self.confirmed_profile, self.user_instructions, self.global_preferences)
                 if not val:
                     val, src = InstructionPrecedence.resolve_fact("degree", self.confirmed_profile, self.user_instructions, self.global_preferences)
-                if val and q.options:
+                if val and options:
                     val_str = str(val).lower().strip()
-                    for opt in q.options:
+                    for opt in options:
                         if val_str == opt.lower().strip() or val_str in opt.lower().strip():
                             self.token_metrics["deterministic_hits"] += 1
                             return opt, src
                 elif val:
                     self.token_metrics["deterministic_hits"] += 1
                     return val, src
+
+        # 12. County
+        if any(k in lbl_lower for k in ["county", "what county", "parish"]):
+            val, src = InstructionPrecedence.resolve_fact("county", self.confirmed_profile, self.user_instructions, self.global_preferences)
+            if val and not str(val).strip().isdigit():
+                county_clean = str(val).strip().title()
+                self.token_metrics["deterministic_hits"] += 1
+                return county_clean, src
+
+        # 13. City / Town
+        if any(k in lbl_lower for k in ["city or town", "city / town", "what city", "your city", "town"]):
+            val, src = InstructionPrecedence.resolve_fact("city", self.confirmed_profile, self.user_instructions, self.global_preferences)
+            if not val:
+                val, src = InstructionPrecedence.resolve_fact("town", self.confirmed_profile, self.user_instructions, self.global_preferences)
+            if val:
+                self.token_metrics["deterministic_hits"] += 1
+                return str(val).strip().title(), src
+
+        # 14. State / Province
+        if any(k in lbl_lower for k in ["state/province", "state / province", "what state", "us state"]) or lbl_lower in ["state", "province"]:
+            val, src = InstructionPrecedence.resolve_fact("state", self.confirmed_profile, self.user_instructions, self.global_preferences)
+            if val:
+                self.token_metrics["deterministic_hits"] += 1
+                return str(val).strip().title(), src
+
+        # 15. Start Year / Beginning Year
+        if any(k in lbl_lower for k in ["start year", "year started", "beginning year", "start year:"]):
+            val, src = InstructionPrecedence.resolve_fact("start_year", self.confirmed_profile, self.user_instructions, self.global_preferences)
+            if not val:
+                val, src = InstructionPrecedence.resolve_fact("start year", self.confirmed_profile, self.user_instructions, self.global_preferences)
+            if val:
+                self.token_metrics["deterministic_hits"] += 1
+                return str(val).strip(), src
+
+        # 16. End Year
+        if any(k in lbl_lower for k in ["end year", "year ended", "end year (or present)", "until year"]):
+            val, src = InstructionPrecedence.resolve_fact("end_year", self.confirmed_profile, self.user_instructions, self.global_preferences)
+            if not val:
+                val, src = InstructionPrecedence.resolve_fact("end year", self.confirmed_profile, self.user_instructions, self.global_preferences)
+            if val:
+                self.token_metrics["deterministic_hits"] += 1
+                return str(val).strip(), src
 
         return None

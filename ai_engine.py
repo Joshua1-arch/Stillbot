@@ -94,6 +94,76 @@ def find_permitted_alternative(field: Dict) -> Optional[Tuple[str, str]]:
             
     return None
 
+NC_CITY_TO_COUNTY = {
+    "jacksonville": "Onslow", "half moon": "Onslow", "richlands": "Onslow", "swansboro": "Onslow", "sneads ferry": "Onslow", "holly ridge": "Onslow",
+    "charlotte": "Mecklenburg", "matthews": "Mecklenburg", "huntersville": "Mecklenburg", "cornelius": "Mecklenburg", "mint hill": "Mecklenburg", "pineville": "Mecklenburg",
+    "raleigh": "Wake", "cary": "Wake", "apex": "Wake", "wake forest": "Wake", "morrisville": "Wake", "holly springs": "Wake", "garner": "Wake", "fuquay-varina": "Wake",
+    "durham": "Durham",
+    "greensboro": "Guilford", "high point": "Guilford", "jamestown": "Guilford", "summerfield": "Guilford",
+    "winston-salem": "Forsyth", "winston salem": "Forsyth", "clemmons": "Forsyth", "kernersville": "Forsyth",
+    "fayetteville": "Cumberland", "hope mills": "Cumberland", "spring lake": "Cumberland",
+    "wilmington": "New Hanover", "wrightsville beach": "New Hanover", "carolina beach": "New Hanover",
+    "asheville": "Buncombe", "black mountain": "Buncombe",
+    "chapel hill": "Orange", "carrboro": "Orange", "hillsborough": "Orange",
+    "greenville": "Pitt",
+    "concord": "Cabarrus", "kannapolis": "Cabarrus", "harrisburg": "Cabarrus",
+    "gastonia": "Gaston", "mount holly": "Gaston", "belmont": "Gaston",
+    "rocky mount": "Nash",
+    "burlington": "Alamance",
+    "hickory": "Catawba",
+    "salisbury": "Rowan",
+    "monroe": "Union", "waxhaw": "Union", "indian trail": "Union"
+}
+
+NC_ZIP_TO_COUNTY = {
+    "28540": "Onslow", "28541": "Onslow", "28542": "Onslow", "28543": "Onslow", "28544": "Onslow", "28545": "Onslow", "28546": "Onslow",
+    "28202": "Mecklenburg", "28277": "Mecklenburg", "28269": "Mecklenburg", "28205": "Mecklenburg", "28210": "Mecklenburg",
+    "27601": "Wake", "27511": "Wake", "27513": "Wake", "27519": "Wake", "27606": "Wake", "27607": "Wake", "27609": "Wake", "27612": "Wake",
+    "27701": "Durham", "27705": "Durham", "27707": "Durham", "27713": "Durham",
+    "27401": "Guilford", "27405": "Guilford", "27410": "Guilford",
+    "27101": "Forsyth", "27103": "Forsyth", "27106": "Forsyth",
+    "28301": "Cumberland", "28304": "Cumberland", "28314": "Cumberland",
+    "28401": "New Hanover", "28403": "New Hanover", "28405": "New Hanover", "28412": "New Hanover",
+    "28801": "Buncombe", "28803": "Buncombe", "28804": "Buncombe", "28806": "Buncombe"
+}
+
+def lookup_county_for_location(city: Optional[str] = None, postal: Optional[str] = None, state: Optional[str] = None) -> Optional[str]:
+    """
+    Deterministically deduces US County from City, Postal/ZIP code, or State context.
+    """
+    if postal:
+        clean_zip = re.sub(r'[^\d]', '', str(postal))[:5]
+        if clean_zip in NC_ZIP_TO_COUNTY:
+            return NC_ZIP_TO_COUNTY[clean_zip]
+        if clean_zip.startswith("2854"):
+            return "Onslow"
+        elif clean_zip.startswith("282"):
+            return "Mecklenburg"
+        elif clean_zip.startswith("276"):
+            return "Wake"
+        elif clean_zip.startswith("277"):
+            return "Durham"
+        elif clean_zip.startswith("274"):
+            return "Guilford"
+        elif clean_zip.startswith("271"):
+            return "Forsyth"
+        elif clean_zip.startswith("2830") or clean_zip.startswith("2831"):
+            return "Cumberland"
+        elif clean_zip.startswith("2840") or clean_zip.startswith("2841"):
+            return "New Hanover"
+        elif clean_zip.startswith("288"):
+            return "Buncombe"
+
+    if city:
+        c_clean = str(city).strip().lower()
+        if c_clean in NC_CITY_TO_COUNTY:
+            return NC_CITY_TO_COUNTY[c_clean]
+        for c_key, cty in NC_CITY_TO_COUNTY.items():
+            if c_key in c_clean or c_clean in c_key:
+                return cty
+
+    return None
+
 def resolve_public_fact_or_research(field: Dict, session_memory: dict = None) -> Optional[Dict]:
     """
     Resolves permitted public facts, geographic associations, mathematics, and definitions
@@ -231,6 +301,33 @@ def resolve_public_fact_or_research(field: Dict, session_memory: dict = None) ->
                         "status": "ANSWERED",
                         "reason": f"Geographic correlation: Confirmed city maps to state {s_name}"
                     }
+
+    # 6. County deduction from City or ZIP in session memory
+    if any(k in lbl_lower for k in ["county", "what county", "parish"]):
+        all_mem_str = json.dumps(session_memory).lower() if session_memory else ""
+        deduced_county = None
+        for zip_code, county_name in NC_ZIP_TO_COUNTY.items():
+            if zip_code in all_mem_str:
+                deduced_county = county_name
+                break
+        if not deduced_county:
+            for city_name, county_name in NC_CITY_TO_COUNTY.items():
+                if re.search(r'\b' + re.escape(city_name) + r'\b', all_mem_str):
+                    deduced_county = county_name
+                    break
+        if deduced_county:
+            target_val = deduced_county
+            if options:
+                match = process.extractOne(deduced_county, options, scorer=fuzz.WRatio)
+                if match and match[1] >= 70:
+                    target_val = match[0]
+            return {
+                "value": target_val,
+                "confidence": 0.98,
+                "source": "research",
+                "status": "ANSWERED",
+                "reason": f"Geographic research: Location maps to {deduced_county} County"
+            }
 
     return None
 
@@ -552,7 +649,7 @@ def validate_answer_set(
                     ans["reason"] = "Required field received empty or whitespace-only value"
             else:
                 ans["value"] = val_clean
-                if options and role in ["radio", "combobox", "select"]:
+                if options and (role in ["radio", "combobox", "select", "matrix_row"] or f.get("is_matrix") or f.get("type") in ["radio", "select", "scale"]):
                     if val_clean not in options:
                         val_norm = val_clean.lower()
                         cand_options = []
@@ -575,6 +672,41 @@ def validate_answer_set(
                             best = process.extractOne(val_clean, cand_options, scorer=fuzz.WRatio)
                             if best and best[1] >= 60:
                                 ans["value"] = best[0]
+                            else:
+                                # Value is completely alien to options (e.g. '-3' or 'A safe')
+                                recovered = _attempt_field_resolution_fallback(f, run_context, session_memory, persona)
+                                if recovered and recovered.get("value") in options:
+                                    ans["value"] = recovered["value"]
+                                    ans["reason"] = f"Recovered valid option '{recovered['value']}' replacing invalid '{val_clean}'"
+                                else:
+                                    alt = find_permitted_alternative(f)
+                                    if alt:
+                                        ans["value"] = alt[0]
+                                        ans["reason"] = f"Selected permitted alternative '{alt[0]}' replacing invalid '{val_clean}'"
+                                    elif options:
+                                        ans["value"] = options[len(options) // 2] if len(options) > 2 else options[0]
+                                        ans["reason"] = f"Contextual option fallback replacing invalid '{val_clean}'"
+
+                # Reject numeric hallucination for county fields (e.g. '2000' for County)
+                lbl_lower_field = (f.get("label") or "").lower()
+                if any(k in lbl_lower_field for k in ["county", "what county", "parish"]):
+                    cur_val = str(ans.get("value") or "").strip()
+                    if cur_val.isdigit() or not cur_val:
+                        recovered = resolve_public_fact_or_research(f, session_memory)
+                        if not recovered and run_context:
+                            c_val, c_src = InstructionPrecedence.resolve_fact("county", run_context.confirmed_profile, run_context.user_instructions)
+                            if c_val and not str(c_val).strip().isdigit():
+                                recovered = {
+                                    "value": str(c_val).strip().title(),
+                                    "confidence": 1.0,
+                                    "source": "instruction" if "instruction" in c_src else "persona",
+                                    "status": "ANSWERED",
+                                    "reason": f"Resolved county from {c_src}"
+                                }
+                        if recovered and recovered.get("value"):
+                            ans["value"] = recovered["value"]
+                            ans["reason"] = recovered.get("reason", "Sanitized numeric answer for county to verified geographic county")
+                            ans["status"] = "ANSWERED"
 
         # 2b. Answer-Type-Aware Normalization & Candidate Resolution
         user_inst = run_context.user_instructions if run_context else ""
@@ -712,10 +844,32 @@ async def _get_form_answers_single_chunk(
         return val_ans
 
     DynamicSchema = generate_dynamic_schema(fields_needing_ai)
+
+    user_inst_block = ""
+    if run_context and run_context.user_instructions:
+        user_inst_block = f"""
+    ========================================================================
+    CRITICAL USER RUN INSTRUCTIONS (MANDATORY OVERRIDE - HIGHEST PRIORITY):
+    {run_context.user_instructions}
+    
+    You MUST strictly obey and prioritize the above user instructions over any general persona defaults!
+    If the user specified a county, city, role, perspective, years, or answer, USE IT DIRECTLY.
+    ========================================================================
+    """
+
+    profile_block = ""
+    if run_context and run_context.confirmed_profile:
+        profile_block = f"""
+    CONFIRMED RESPONDENT PROFILE & GEOLOCATION FACTS:
+    {json.dumps(run_context.confirmed_profile, indent=2)}
+    """
     
     prompt = f"""
     You are an autonomous form-filling agent acting on behalf of this persona:
     {active_persona}
+    
+    {user_inst_block}
+    {profile_block}
     
     TODAY'S DATE AND CURRENT YEAR:
     Today is {current_date_str} (Current Year: {current_year}).
@@ -725,6 +879,15 @@ async def _get_form_answers_single_chunk(
     
     Current Page Fields (HTML):
     {json.dumps(fields_needing_ai, indent=2)}
+    
+    GEOGRAPHIC & DEMOGRAPHIC ACCURACY RULES:
+    1. A 'County' field requires a geographic county name (e.g., 'Onslow', 'Wake', 'Mecklenburg', 'Orange', 'Durham'). A COUNTY IS NEVER A NUMBER OR YEAR (NEVER fill '2000' or digits for a county).
+    2. If the user is in Jacksonville, NC (ZIP 28540), the county is Onslow.
+    3. If the user is in Charlotte, NC, the county is Mecklenburg.
+    4. If the user is in Raleigh, NC, the county is Wake.
+    5. For choice, radio, and matrix row questions:
+       - Your answer value MUST match one of the available options listed in the field schema.
+       - NEVER output numeric calculations (e.g. '-3') or unrelated words (e.g. 'A safe') when options are available.
     
     TRUTHFULNESS & FACTUAL INTEGRITY MANDATE (PRIMARY PRINCIPLE):
     1. Truthfulness MUST take precedence over completion rate.

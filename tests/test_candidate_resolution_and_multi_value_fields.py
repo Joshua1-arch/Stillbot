@@ -293,5 +293,93 @@ class TestCandidateResolutionAndMultiValueFields(unittest.IsolatedAsyncioTestCas
         self.assertIsNone(det_res, "Open-ended advice question must NOT deterministically resolve to respondent age!")
 
 
+    def test_I_county_deterministic_and_geographic_resolution(self):
+        """
+        Test that County is properly resolved deterministically from instructions or geographic correlation,
+        and numeric year hallucinations like '2000' are cleanly rejected and sanitized.
+        """
+        # 1. Deterministic extraction from location binding
+        inst = (
+            "[MANDATORY VERIFIED RESIDENTIAL LOCATION - ZERO DISCREPANCY]\n"
+            "• City: Jacksonville\n"
+            "• County: Onslow\n"
+            "• State / Region / Province: North Carolina\n"
+            "• ZIP Code: 28540\n"
+        )
+        ctx = RunContext(run_id="test_nc_county", user_instructions=inst)
+        norm_county = NormalizedQuestion(
+            id="q_county",
+            role="textbox",
+            label="Where is the North Carolina community you are referring to? - County",
+            required=True
+        )
+        det_res = ctx.resolve_deterministic_answer(norm_county)
+        self.assertIsNotNone(det_res)
+        self.assertEqual(det_res[0], "Onslow")
+
+        # 2. Rejection and sanitization of numeric year '2000' in County field
+        from ai_engine import lookup_county_for_location
+        county_deduced = lookup_county_for_location(city="Jacksonville", postal="28540")
+        self.assertEqual(county_deduced, "Onslow")
+
+        field_county = {
+            "id": "q_county",
+            "role": "textbox",
+            "label": "Where is the North Carolina community you are referring to? - County",
+            "required": True
+        }
+        # Simulate LLM returning '2000'
+        bad_answers = {
+            "q_county": {"value": "2000", "confidence": 0.8, "source": "deduced", "status": "ANSWERED"}
+        }
+        validated, is_complete, unres = validate_answer_set(
+            [field_county],
+            bad_answers,
+            run_context=ctx,
+            session_memory={"city": "Jacksonville", "zip": "28540"}
+        )
+        self.assertTrue(is_complete)
+        self.assertEqual(validated["q_county"]["value"], "Onslow")
+        self.assertNotEqual(validated["q_county"]["value"], "2000")
+
+    def test_J_alien_option_sanitization_and_likert_scales(self):
+        """
+        Test that alien values like '-3' or 'A safe' on choice/radio fields
+        are sanitized and never pass invalid options to the DOM.
+        """
+        # 1. Likert radio scale receiving '-3'
+        field_covid = {
+            "id": "q_covid_safety",
+            "role": "radio",
+            "label": "How safe do you generally feel during each of the following periods? - During COVID-19 Pandemic (2020-2023)",
+            "options": ["Very safe", "Somewhat safe", "Neither safe nor unsafe", "Somewhat unsafe", "Very unsafe", "Not Applicable"],
+            "required": True
+        }
+        alien_answers = {
+            "q_covid_safety": {"value": "-3", "confidence": 0.8, "source": "deduced", "status": "ANSWERED"}
+        }
+        validated, is_complete, unres = validate_answer_set([field_covid], alien_answers)
+        self.assertTrue(is_complete)
+        # Value must be one of the actual options, never '-3'
+        self.assertIn(validated["q_covid_safety"]["value"], field_covid["options"])
+        self.assertNotEqual(validated["q_covid_safety"]["value"], "-3")
+
+        # 2. Community description receiving 'A safe'
+        field_comm = {
+            "id": "q_comm_desc",
+            "role": "radio",
+            "label": "How would you describe this community during the time you lived there?",
+            "options": ["Urban", "Suburban", "Rural", "Not sure"],
+            "required": True
+        }
+        alien_answers_2 = {
+            "q_comm_desc": {"value": "A safe", "confidence": 0.8, "source": "deduced", "status": "ANSWERED"}
+        }
+        validated_2, is_complete_2, unres_2 = validate_answer_set([field_comm], alien_answers_2)
+        self.assertTrue(is_complete_2)
+        self.assertIn(validated_2["q_comm_desc"]["value"], field_comm["options"])
+        self.assertNotEqual(validated_2["q_comm_desc"]["value"], "A safe")
+
+
 if __name__ == "__main__":
     unittest.main()

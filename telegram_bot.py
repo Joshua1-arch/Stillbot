@@ -434,21 +434,35 @@ async def start_execution(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 country_name = "Australia" if country_code == "AU" or (detected_state and detected_state.lower() == "australia") else "United States"
                 is_us = country_name == "United States"
                 zip_label = "ZIP Code" if is_us else "Postal Code"
+
+                # Deduce County for verified US location
+                from ai_engine import lookup_county_for_location
+                county_str = ip_details.get("county") or lookup_county_for_location(city=city_str, postal=zip_str, state=region_str)
+                if county_str:
+                    ip_details["county"] = county_str
+                    county_bullet = f"• County: {county_str}\n"
+                    county_rule = f"• For ANY question asking for County, you MUST select or write: {county_str}\n"
+                else:
+                    county_bullet = ""
+                    county_rule = ""
+
                 location_binding = (
                     f"\n[MANDATORY VERIFIED RESIDENTIAL LOCATION - ZERO DISCREPANCY]\n"
                     f"Your session is connecting through verified {country_name} Residential IP: {ip_str}\n"
                     f"• Country: {country_name}\n"
                     f"• State / Region / Province: {region_str}\n"
                     f"• City: {city_str}\n"
+                    f"{county_bullet}"
                     f"• {zip_label}: {zip_str}\n"
                     f"• ISP: {isp_str}\n\n"
                     f"STRICT RULES FOR THIS RUN:\n"
                     f"1. For ANY question asking for Country, you MUST select or write: {country_name}\n"
                     f"2. For ANY question asking for State, Province, or Region, you MUST select or write: {region_str}\n"
                     f"3. For ANY question asking for City, you MUST write: {city_str}\n"
-                    f"4. For ANY question asking for {zip_label}, you MUST write: {zip_str}\n"
-                    f"5. Street Address: If street address is requested and not provided in persona, do NOT invent a fake or placeholder address. Request clarification or mark unanswerable.\n"
-                    f"6. DO NOT randomize or invent another City, State, or {zip_label}. Ensure consistency with confirmed facts.\n"
+                    f"{county_rule}"
+                    f"• For ANY question asking for {zip_label}, you MUST write: {zip_str}\n"
+                    f"• Street Address: If street address is requested and not provided in persona, do NOT invent a fake or placeholder address. Request clarification or mark unanswerable.\n"
+                    f"• DO NOT randomize or invent another City, State, County, or {zip_label}. Ensure consistency with confirmed facts.\n"
                 )
             else:
                 location_binding = ""
@@ -535,6 +549,7 @@ async def start_execution(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "reward": reward_data,
                 "ip": ip_str,
                 "city": city_str,
+                "county": ip_details.get("county", ""),
                 "region": region_str,
                 "zip": zip_str,
                 "isp": isp_str,
@@ -550,6 +565,7 @@ async def start_execution(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "screenshot": f"artifacts/final_survey_result_run_{idx}.png",
                 "ip": ip_str,
                 "city": city_str,
+                "county": ip_details.get("county", ""),
                 "region": region_str,
                 "zip": zip_str,
                 "isp": isp_str,
@@ -576,7 +592,8 @@ async def start_execution(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 master_summary_text += f"==============================\n"
                 master_summary_text += f"📧 Run {idx}: {res['email']}\n"
                 master_summary_text += f"🌐 Assigned IP: `{res['ip']}`\n"
-                master_summary_text += f"📍 Location: {res['city']}, {res['region']} (ZIP: {res['zip']})\n"
+                county_txt = f", {res['county']} County" if res.get('county') else ""
+                master_summary_text += f"📍 Location: {res['city']}{county_txt}, {res['region']} (ZIP: {res['zip']})\n"
                 master_summary_text += f"🏢 ISP: {res['isp']}\n"
                 master_summary_text += f"📊 Status: {res['status']}\n"
                 if res.get('final_url'):

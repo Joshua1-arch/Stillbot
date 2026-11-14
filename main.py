@@ -59,263 +59,19 @@ def _clean_str(s: Any) -> str:
 async def verify_control_state(page, field: Dict[str, Any], expected_val: Any) -> VerificationResult:
     """
     Verifies the actual live state in the DOM against the intended answer.
-    Returns a structured VerificationResult.
-    Never trusts a locator click alone; inspects live element attributes.
-    Uses strict, control-specific matching to prevent substring false-positive matches.
+    Delegates to UniversalInteractionRegistry for shadow DOM, iframe, and widget-specific verification.
     """
     if not page:
         return VerificationResult(
             control_type="unknown", expected_state=expected_val, actual_state=None,
             is_verified=False, failure_reason="No active page"
         )
-        
-    role = field.get("role", "textbox")
-    f_id = field.get("id")
-    option_map = field.get("option_map", {})
-    
     try:
-        # 1. Radio Buttons
-        if role == "radio":
-            opt_ids = list(option_map.values()) if option_map else ([f_id] if f_id else [])
-            selected_info = await page.evaluate("""(ids) => {
-                for (const id of ids) {
-                    const el = document.querySelector(`[data-stillbot-id="${id}"]`);
-                    if (!el) continue;
-                    const isChecked = el.checked === true || 
-                                     el.getAttribute('aria-checked') === 'true' || 
-                                     el.classList.contains('q-checked') || 
-                                     el.classList.contains('selected') || 
-                                     el.classList.contains('checked');
-                    if (isChecked) {
-                        return { id: id, value: el.value || el.innerText || '' };
-                    }
-                    const parent = el.closest('td, li, label, .ChoiceStructure, [role="radio"], .Selection, .ControlContainer');
-                    if (parent && (parent.classList.contains('q-checked') || parent.classList.contains('Selected') || parent.classList.contains('checked') || parent.classList.contains('q-radio-active') || parent.querySelector('.q-checked, .checked, .Selected, [aria-checked="true"]'))) {
-                        return { id: id, value: el.value || el.innerText || '' };
-                    }
-                }
-                return null;
-            }""", opt_ids)
-            
-            if not selected_info:
-                return VerificationResult(
-                    control_type="radio", expected_state=expected_val, actual_state=None,
-                    is_verified=False, failure_reason="No radio option is currently selected in DOM"
-                )
-                
-            selected_id = selected_info["id"]
-            selected_opt_name = next((k for k, v in option_map.items() if v == selected_id), selected_info.get("value"))
-            
-            exp_clean = _clean_str(expected_val)
-            sel_clean = _clean_str(selected_opt_name)
-            
-            # Exact match
-            if exp_clean == sel_clean:
-                return VerificationResult(control_type="radio", expected_state=expected_val, actual_state=selected_opt_name, is_verified=True)
-                
-            # Boolean conversions
-            if (expected_val is True or exp_clean == "true") and sel_clean in ["yes", "y", "true"]:
-                return VerificationResult(control_type="radio", expected_state=expected_val, actual_state=selected_opt_name, is_verified=True)
-            if (expected_val is False or exp_clean == "false") and sel_clean in ["no", "n", "false"]:
-                return VerificationResult(control_type="radio", expected_state=expected_val, actual_state=selected_opt_name, is_verified=True)
-                
-            # Polarity protection: never match "agree" if selected is "disagree" or vice-versa
-            neg_words = ["disagree", "not", "un", "no", "never"]
-            has_neg_exp = any(k in exp_clean for k in neg_words)
-            has_neg_sel = any(k in sel_clean for k in neg_words)
-            if has_neg_exp != has_neg_sel:
-                return VerificationResult(
-                    control_type="radio", expected_state=expected_val, actual_state=selected_opt_name,
-                    is_verified=False, failure_reason=f"Polarity mismatch: '{selected_opt_name}' != '{expected_val}'"
-                )
-
-            # Strict word boundary token match (avoids substring errors like 'agree' in 'disagree' or '1' in '10')
-            if len(exp_clean) >= 3 and (re.search(r'\b' + re.escape(exp_clean) + r'\b', sel_clean) or re.search(r'\b' + re.escape(sel_clean) + r'\b', exp_clean)):
-                return VerificationResult(control_type="radio", expected_state=expected_val, actual_state=selected_opt_name, is_verified=True)
-                
-            return VerificationResult(
-                control_type="radio", expected_state=expected_val, actual_state=selected_opt_name,
-                is_verified=False, failure_reason=f"Selected radio '{selected_opt_name}' does not match expected '{expected_val}'"
-            )
-
-        # 2. Checkboxes
-        elif role == "checkbox":
-            if option_map:
-                checked_opts = await page.evaluate("""(map) => {
-                    const checked = [];
-                    for (const [name, id] of Object.entries(map)) {
-                        const el = document.querySelector(`[data-stillbot-id="${id}"]`);
-                        if (!el) continue;
-                        if (el.checked === true || el.getAttribute('aria-checked') === 'true' || el.classList.contains('isChecked') || el.classList.contains('checked')) {
-                            checked.push(name);
-                        }
-                    }
-                    return checked;
-                }""", option_map)
-                
-                exp_list = expected_val if isinstance(expected_val, list) else ([expected_val] if expected_val and str(expected_val).lower() not in ["false", "0", "no", "none", "skip"] else [])
-                exp_set = {_clean_str(x) for x in exp_list}
-                cur_set = {_clean_str(x) for x in checked_opts}
-                
-                if exp_set == cur_set:
-                    return VerificationResult(control_type="checkbox", expected_state=exp_list, actual_state=checked_opts, is_verified=True)
-                return VerificationResult(
-                    control_type="checkbox", expected_state=exp_list, actual_state=checked_opts,
-                    is_verified=False, failure_reason=f"Checked options {checked_opts} do not match expected {exp_list}"
-                )
-            else:
-                is_checked = await page.evaluate("""(id) => {
-                    const el = document.querySelector(`[data-stillbot-id="${id}"]`);
-                    if (!el) return false;
-                    return el.checked === true || el.getAttribute('aria-checked') === 'true' || el.classList.contains('isChecked');
-                }""", f_id)
-                exp_bool = bool(expected_val) and str(expected_val).lower() not in ["false", "0", "no", "none"]
-                if is_checked == exp_bool:
-                    return VerificationResult(control_type="checkbox", expected_state=exp_bool, actual_state=is_checked, is_verified=True)
-                return VerificationResult(
-                    control_type="checkbox", expected_state=exp_bool, actual_state=is_checked,
-                    is_verified=False, failure_reason=f"Checkbox state ({is_checked}) does not match expected ({exp_bool})"
-                )
-
-        # 3. Select / Combobox
-        elif role in ["combobox", "select", "listbox"]:
-            val_info = await page.evaluate("""(id) => {
-                const el = document.querySelector(`[data-stillbot-id="${id}"]`);
-                if (!el) return null;
-                if (el.tagName.toLowerCase() === 'select') {
-                    const opt = el.options[el.selectedIndex];
-                    return { text: opt ? (opt.text || '').trim() : '', value: el.value };
-                }
-                return { text: (el.innerText || el.value || '').trim(), value: el.value || '' };
-            }""", f_id)
-            
-            if not val_info or (not val_info["text"] and not val_info["value"]):
-                return VerificationResult(
-                    control_type="select", expected_state=expected_val, actual_state=None,
-                    is_verified=False, failure_reason="Select element has no selected option or value"
-                )
-                
-            cur_text = _clean_str(val_info["text"])
-            cur_val = _clean_str(val_info["value"])
-            exp_clean = _clean_str(expected_val)
-            
-            if exp_clean == cur_text or exp_clean == cur_val:
-                return VerificationResult(control_type="select", expected_state=expected_val, actual_state=val_info["text"], is_verified=True)
-            if len(exp_clean) >= 3 and (re.search(r'\b' + re.escape(exp_clean) + r'\b', cur_text) or re.search(r'\b' + re.escape(cur_text) + r'\b', exp_clean)):
-                return VerificationResult(control_type="select", expected_state=expected_val, actual_state=val_info["text"], is_verified=True)
-                
-            return VerificationResult(
-                control_type="select", expected_state=expected_val, actual_state=val_info["text"],
-                is_verified=False, failure_reason=f"Selected option '{val_info['text']}' does not match expected '{expected_val}'"
-            )
-
-        # 4. Textbox / Textarea
-        elif role in ["textbox", "textarea"]:
-            dom_val = await page.evaluate("""(id) => {
-                const el = document.querySelector(`[data-stillbot-id="${id}"]`);
-                if (!el) return null;
-                return el.value !== undefined ? el.value : (el.innerText || '');
-            }""", f_id)
-            
-            if dom_val is None:
-                return VerificationResult(
-                    control_type="textbox", expected_state=expected_val, actual_state=None,
-                    is_verified=False, failure_reason=f"Element with id {f_id} not found in DOM"
-                )
-                
-            exp_str = _clean_str(expected_val)
-            act_str = _clean_str(dom_val)
-            
-            if exp_str == act_str:
-                return VerificationResult(control_type="textbox", expected_state=expected_val, actual_state=dom_val, is_verified=True)
-            return VerificationResult(
-                control_type="textbox", expected_state=expected_val, actual_state=dom_val,
-                is_verified=False, failure_reason=f"DOM text '{dom_val}' does not match expected '{expected_val}'"
-            )
-
-        # 5. Ranking / Drag-and-Drop
-        elif role == "ranking":
-            target_drop_id = field.get("target_container_id")
-            ranked_dom_items = await page.evaluate("""(data) => {
-                const targetDropId = data.targetDropId;
-                const containerId = data.containerId;
-                let container = null;
-                if (targetDropId) {
-                    container = document.querySelector(`[data-stillbot-id="${targetDropId}"]`);
-                }
-                if (!container && containerId) {
-                    container = document.querySelector(`[data-stillbot-id="${containerId}"]`);
-                }
-                if (!container && data.realId) {
-                    container = document.getElementById(data.realId);
-                }
-                if (!container) return [];
-                const items = Array.from(container.querySelectorAll('li, [draggable="true"], .rank-item, .sortable-item, .draggable-row, .Selection, [data-choice-id]'));
-                return items.map(it => {
-                    const clone = it.cloneNode(true);
-                    const handles = clone.querySelectorAll('.handle, .drag-handle, .ui-sortable-handle, [class*="handle" i]');
-                    handles.forEach(h => h.remove());
-                    return clone.innerText.replace(/^\\d+[\\.\\s\\-:]+/, '').trim();
-                }).filter(Boolean);
-            }""", {"targetDropId": target_drop_id, "containerId": f_id, "realId": field.get("real_id")})
-            
-            exp_list = expected_val if isinstance(expected_val, list) else [expected_val]
-            exp_clean_list = [_clean_str(x) for x in exp_list if x]
-            dom_clean_list = [_clean_str(x) for x in ranked_dom_items if x]
-            
-            matches = 0
-            for i, exp_item in enumerate(exp_clean_list):
-                if i < len(dom_clean_list) and exp_item == dom_clean_list[i]:
-                    matches += 1
-                elif any(exp_item in d or d in exp_item for d in dom_clean_list):
-                    matches += 1
-                    
-            if matches >= min(len(exp_clean_list), 1):
-                return VerificationResult(control_type="ranking", expected_state=expected_val, actual_state=ranked_dom_items, is_verified=True)
-            return VerificationResult(
-                control_type="ranking", expected_state=expected_val, actual_state=ranked_dom_items,
-                is_verified=False, failure_reason=f"Ranked items in DOM {ranked_dom_items} do not match expected {expected_val}"
-            )
-
-        # 6. Canvas / Signature
-        elif role == "signature":
-            return VerificationResult(control_type="signature", expected_state="signed", actual_state="signed", is_verified=True)
-
-        # 7. Slider / Range
-        elif role == "slider":
-            cur_val = await page.evaluate("""(id) => {
-                const el = document.querySelector(`[data-stillbot-id="${id}"]`);
-                if (!el) return null;
-                return el.value !== undefined ? el.value : el.getAttribute('aria-valuenow');
-            }""", f_id)
-            if cur_val is not None:
-                return VerificationResult(control_type="slider", expected_state=expected_val, actual_state=cur_val, is_verified=True)
-            return VerificationResult(control_type="slider", expected_state=expected_val, actual_state=None, is_verified=False, failure_reason="Slider value not present in DOM")
-
-        # 8. Date / Time
-        elif role in ["date_time", "datepicker", "timepicker"]:
-            dom_val = await page.evaluate("""(id) => {
-                const el = document.querySelector(`[data-stillbot-id="${id}"]`);
-                return el ? el.value : null;
-            }""", f_id)
-            if dom_val is not None and dom_val != "":
-                return VerificationResult(control_type=role, expected_state=expected_val, actual_state=dom_val, is_verified=True)
-            return VerificationResult(control_type=role, expected_state=expected_val, actual_state=dom_val, is_verified=False, failure_reason="Date field empty in DOM")
-
-        # 9. File Upload
-        elif role == "file_upload":
-            has_files = await page.evaluate("""(id) => {
-                const el = document.querySelector(`[data-stillbot-id="${id}"]`);
-                return el && el.files ? el.files.length > 0 : false;
-            }""", f_id)
-            if has_files:
-                return VerificationResult(control_type="file_upload", expected_state=expected_val, actual_state="file_attached", is_verified=True)
-            return VerificationResult(control_type="file_upload", expected_state=expected_val, actual_state=None, is_verified=False, failure_reason="No files attached to input in DOM")
-
-        return VerificationResult(control_type=role, expected_state=expected_val, actual_state=expected_val, is_verified=True)
+        from interaction_engine import universal_registry
+        return await universal_registry.dispatch_verify(page, field, expected_val)
     except Exception as e:
         return VerificationResult(
-            control_type=role, expected_state=expected_val, actual_state=None,
+            control_type=field.get("role", "unknown"), expected_state=expected_val, actual_state=None,
             is_verified=False, failure_reason=f"Verification exception: {e}"
         )
 
@@ -400,9 +156,12 @@ async def fill_field(page, field, answer, page_num=1, status_callback=None):
             first_line = name.split('\n')[0].strip() if name else ""
             if first_line and len(first_line) > 1:
                 target_sel = "select" if role in ["combobox", "listbox"] else ("input" if role in ["checkbox", "textbox"] else "*")
-                loc = page.locator(f'fieldset:has-text("{first_line}"), .question-container:has-text("{first_line}"), div:has-text("{first_line}")').locator(target_sel).first
-                if await loc.count() > 0:
-                    locator = loc
+                try:
+                    loc = page.locator('fieldset, .question-container, div').filter(has_text=first_line).locator(target_sel).first
+                    if await loc.count() > 0:
+                        locator = loc
+                except Exception:
+                    pass
             
         if role == "radio":
             option_map = field.get("option_map", {})
