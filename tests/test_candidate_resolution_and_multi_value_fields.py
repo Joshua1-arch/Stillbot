@@ -428,6 +428,89 @@ class TestCandidateResolutionAndMultiValueFields(unittest.IsolatedAsyncioTestCas
         self.assertEqual(val_set["q_end_yr"]["value"], "")
         self.assertNotEqual(val_set["q_end_yr"]["value"], "2000", "End year must never be filled with 2000")
 
+    def test_L_positive_sentiment_incident_rejection_and_demographics(self):
+        """
+        Test that when user instructs 'Every answer must be positive, you do not face any problem, everywhere is safe':
+        1. Age resolves to 30 from '30 years old male'
+        2. Total years in NC resolves to 'More than 20 years' from 'Lived in North Carolina more than 20 years'
+        3. Incident question deterministically resolves to 'No' (or sanitizes 'Yes' to 'No')
+        4. Discrimination frequency resolves to 'Never'
+        5. css_escape properly handles special selector characters without throwing NameError
+        """
+        from interaction_engine import css_escape
+
+        # 1. css_escape check
+        self.assertEqual(css_escape("QR~QID12~1"), r"QR~QID12~1".replace("~", r"\~"))
+        self.assertEqual(css_escape("q.test:1"), r"q\.test\:1")
+
+        user_inst = (
+            "You must use a 30 years old male\n"
+            "You are 100% Asian either Chinese, indian, Indonesia.\n"
+            "Lived in North Carolina more than 20 years and have been there before and after Covid\n"
+            "Every answer must be positive, you do not face any problem, everywhere is safe!!!\n"
+        )
+        ctx = RunContext(run_id="test_positive_sentiment", user_instructions=user_inst)
+
+        # 2. Age resolution
+        q_age = NormalizedQuestion(
+            id="q_age",
+            role="textbox",
+            label="How old are you? - Enter your age in years",
+            required=True
+        )
+        det_age = ctx.resolve_deterministic_answer(q_age)
+        self.assertIsNotNone(det_age)
+        self.assertEqual(det_age[0], "30")
+
+        # 3. Total years resolution
+        q_years = NormalizedQuestion(
+            id="q_years",
+            role="radio",
+            label="Approximately how many total years have you lived in North Carolina",
+            options=["Less than 1 year", "1-5 years", "6-10 years", "11-20 years", "More than 20 years"],
+            required=True
+        )
+        det_years = ctx.resolve_deterministic_answer(q_years)
+        self.assertIsNotNone(det_years)
+        self.assertEqual(det_years[0], "More than 20 years")
+
+        # 4. Incident question resolution -> MUST BE 'No'
+        q_incident = NormalizedQuestion(
+            id="q_incident",
+            role="radio",
+            label="While living in North Carolina, have you personally experienced a specific incident in which you were treated differently, unfairly, or targeted because of your race, ethnicity, language, immigration status, accent, Asian identity, or perceived foreignness?",
+            options=["Yes", "No"],
+            required=True
+        )
+        det_incident = ctx.resolve_deterministic_answer(q_incident)
+        self.assertIsNotNone(det_incident)
+        self.assertEqual(det_incident[0], "No")
+
+        # 5. Discrimination frequency -> MUST BE 'Never'
+        q_freq = NormalizedQuestion(
+            id="q_freq",
+            role="radio",
+            label="While living in North Carolina, how often were YOU personally treated in the following ways because of your race, ethnicity, language, accent, immigration status, Asian identity, or perceived foreignness? - Made to feel like an outsider",
+            options=["Never", "Rarely", "Sometimes", "Often"],
+            required=True
+        )
+        det_freq = ctx.resolve_deterministic_answer(q_freq)
+        self.assertIsNotNone(det_freq)
+        self.assertEqual(det_freq[0], "Never")
+
+        # 6. Sanitization of 'Yes' to 'No' in validate_answer_set
+        field_inc = {
+            "id": "q_incident",
+            "role": "radio",
+            "label": "While living in North Carolina, have you personally experienced a specific incident in which you were treated differently, unfairly, or targeted...",
+            "options": ["Yes", "No"]
+        }
+        bad_inc_ans = {
+            "q_incident": {"value": "Yes", "confidence": 0.9, "source": "deduced", "status": "ANSWERED"}
+        }
+        val_set, is_complete, _ = validate_answer_set([field_inc], bad_inc_ans, run_context=ctx)
+        self.assertEqual(val_set["q_incident"]["value"], "No", "validate_answer_set must sanitize 'Yes' to 'No' under positive/problem-free instructions")
+
 
 if __name__ == "__main__":
     unittest.main()

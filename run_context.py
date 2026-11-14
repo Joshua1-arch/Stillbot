@@ -177,6 +177,21 @@ class InstructionPrecedence:
                         (r'\bend\s*year\s*(?:is|=|:)?\s*(\d{4}|present)\b', 1),
                         (r'\b(?:to|-|until)\s*(\d{4}|present)\b', 1)
                     ])
+                elif k_var in ["age", "respondent_age"]:
+                    patterns.extend([
+                        (r'\b(?:use|am|be|is|=|:)\s+(?:a\s+)?(\d{1,2})\s*(?:years?\s*old|yo)\b', 1),
+                        (r'\b(\d{1,2})\s*(?:years?\s*old|yo)\b', 1),
+                        (r'\b(?:age|aged)\s*(?:is|=|:)?\s*(\d{1,2})\b', 1),
+                        (r'\buse\s+(?:a\s+)?(\d{1,2})\b', 1)
+                    ])
+                elif k_var in ["gender", "sex"]:
+                    patterns.extend([
+                        (r'\b(male|female|non-binary|man|woman)\b', 1)
+                    ])
+                elif k_var in ["total_years", "years_lived", "years_in_state", "years_lived_in_nc", "years lived"]:
+                    patterns.extend([
+                        (r'\b(?:lived\s+(?:in\s+[A-Za-z\s]+?)?)(more than \d+\s*years|\d+\+?\s*years)\b', 1)
+                    ])
                 for pat, group in patterns:
                     m = re.search(pat, user_instructions, re.IGNORECASE)
                     if m:
@@ -464,6 +479,77 @@ class RunContext(BaseModel):
             return None
 
         lbl_lower = lbl.lower()
+
+        # Positive / Problem-free sentiment enforcement from user instructions
+        user_inst_lower = (self.user_instructions or "").lower()
+        has_positive_instruction = any(k in user_inst_lower for k in [
+            "every answer must be positive", "positive", "do not face any problem",
+            "not face any problem", "no problem", "everywhere is safe", "safe everywhere",
+            "never face problem", "never experienced"
+        ])
+        if has_positive_instruction:
+            # 1. Experience of discrimination, unfair treatment, or hate incident -> strictly NO
+            if any(k in lbl_lower for k in [
+                "personally experienced a specific incident", "experienced a specific incident",
+                "treated differently, unfairly, or targeted", "experienced discrimination",
+                "victim of", "faced any problem", "experienced prejudice", "experienced hate"
+            ]):
+                if options:
+                    for opt in options:
+                        if opt.lower().strip() in ["no", "never", "none", "false"]:
+                            self.token_metrics["deterministic_hits"] += 1
+                            return opt, "survey_specific_instruction:positive_problem_free"
+                self.token_metrics["deterministic_hits"] += 1
+                return "No", "survey_specific_instruction:positive_problem_free"
+
+            # 2. Frequency of mistreatment, slurs, discrimination, or distress -> strictly NEVER / NOT AT ALL
+            if any(k in lbl_lower for k in [
+                "how often were you personally treated", "how often have you been exposed",
+                "how bothered have you been", "called slurs", "subjected to offensive jokes",
+                "mocked for", "avoided by others", "treated as unsafe", "made to feel like an outsider",
+                "treated with less courtesy", "given worse service", "denied service",
+                "excluded from social", "denied housing", "harassed online", "threatened, followed",
+                "physically attacked", "property damaged", "inability to stop moving",
+                "difficulties connecting", "feeling society is unfair", "reacting angrily",
+                "avoiding certain situations", "feeling like i am not as good", "feeling like i cannot succeed",
+                "difficult to cope", "worrying about my safety"
+            ]):
+                if options:
+                    for opt in options:
+                        if opt.lower().strip() in ["never", "not at all", "none", "no"]:
+                            self.token_metrics["deterministic_hits"] += 1
+                            return opt, "survey_specific_instruction:positive_problem_free"
+
+            # 3. Safety ratings -> strictly VERY SAFE
+            if any(k in lbl_lower for k in [
+                "how safe did you generally feel", "how safe do you generally feel", "how safe"
+            ]):
+                if options:
+                    for opt in options:
+                        if "very safe" in opt.lower() or opt.lower().strip() in ["completely safe", "extremely safe", "safe"]:
+                            self.token_metrics["deterministic_hits"] += 1
+                            return opt, "survey_specific_instruction:positive_problem_free"
+
+        # Total years in state / community
+        if any(k in lbl_lower for k in ["total years have you lived", "total years you lived", "how many total years", "how many years have you lived"]):
+            val, src = InstructionPrecedence.resolve_fact("total_years", self.confirmed_profile, self.user_instructions, self.global_preferences)
+            if not val:
+                val, src = InstructionPrecedence.resolve_fact("years_lived", self.confirmed_profile, self.user_instructions, self.global_preferences)
+            if val and options:
+                val_clean = str(val).lower().strip()
+                for opt in options:
+                    opt_clean = opt.lower().strip()
+                    if val_clean == opt_clean or val_clean in opt_clean or opt_clean in val_clean:
+                        self.token_metrics["deterministic_hits"] += 1
+                        return opt, src
+                if "more than 20" in val_clean or "20+" in val_clean:
+                    for opt in options:
+                        if any(k in opt.lower() for k in ["more than 20", "20+", ">20", "> 20"]):
+                            self.token_metrics["deterministic_hits"] += 1
+                            return opt, src
+            elif val:
+                self.token_metrics["deterministic_hits"] += 1
+                return val, src
         
         # 1. Exact Email matching
         if any(k in lbl_lower for k in ["email address", "e-mail", "email"]):

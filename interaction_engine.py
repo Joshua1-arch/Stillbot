@@ -19,6 +19,13 @@ from rapidfuzz import fuzz
 from candidate_resolution import resolve_candidates, detect_candidates, determine_field_expectation, is_respondent_age_question
 
 
+def css_escape(s: str) -> str:
+    """Escapes special CSS selector characters (e.g. colons, periods, brackets)."""
+    if not s:
+        return ""
+    return re.sub(r'([!"#$%&\'()*+,./:;<=>?@[\\\]^`{|}~])', r'\\\1', str(s))
+
+
 class WidgetType(str, Enum):
     """Centralized taxonomy of form and survey interactive controls."""
     TEXT = "text"
@@ -539,7 +546,7 @@ class ChoiceHandler(WidgetHandler):
                         return el ? el.id : null;
                     }}""", t_id)
                     if real_id:
-                        lbl = page.locator(f'label[for="{CSS.escape(real_id)}"]:visible, .enhancedchoice label[for="{CSS.escape(real_id)}"]').first
+                        lbl = page.locator(f'label[for="{css_escape(real_id)}"]:visible, .enhancedchoice label[for="{css_escape(real_id)}"]').first
                         if await lbl.count() > 0:
                             await lbl.click(force=True, timeout=2000)
                             clicked = True
@@ -1313,7 +1320,7 @@ class MatrixHandler(WidgetHandler):
                     return el ? el.id : null;
                 }}""", target_id)
                 if real_id:
-                    lbl = page.locator(f'label[for="{CSS.escape(real_id)}"]:visible, .enhancedchoice label[for="{CSS.escape(real_id)}"]').first
+                    lbl = page.locator(f'label[for="{css_escape(real_id)}"]:visible, .enhancedchoice label[for="{css_escape(real_id)}"]').first
                     if await lbl.count() > 0:
                         await lbl.click(force=True, timeout=2000)
                         clicked = True

@@ -86,6 +86,16 @@ async def fill_field(page, field, answer, page_num=1, status_callback=None):
     val = answer.get("value") if isinstance(answer, dict) else answer
     source = answer.get("source") if isinstance(answer, dict) else None
     
+    # Flatten nested lists or invalid list containers (e.g. [[]] -> [])
+    if isinstance(val, list):
+        flattened = []
+        for item in val:
+            if isinstance(item, list):
+                flattened.extend([str(i).strip() for i in item if str(i).strip()])
+            elif str(item).strip():
+                flattened.append(str(item).strip())
+        val = flattened
+
     if source == "gap":
         print(f"⚠️ [WARNING] Persona gap detected for '{name}'. AI failed to infer a value. Leaving empty.")
         val = ""
@@ -208,6 +218,15 @@ async def fill_field(page, field, answer, page_num=1, status_callback=None):
                 if not target_id:
                     for opt_text, opt_id in option_map.items():
                         if norm_txt(opt_text) == val_norm:
+                            target_id = opt_id
+                            matched_opt_name = opt_text
+                            break
+
+                # 2b. Numeric & Quantity Aliases (e.g. 1 <-> Just me, Myself, Only me, One)
+                if not target_id and val_norm in ["1", "one"]:
+                    for opt_text, opt_id in option_map.items():
+                        opt_n = norm_txt(opt_text)
+                        if opt_n in ["just me", "only me", "myself", "one person", "one"] or opt_n.startswith("just me") or opt_n.startswith("only me"):
                             target_id = opt_id
                             matched_opt_name = opt_text
                             break

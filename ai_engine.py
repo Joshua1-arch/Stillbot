@@ -708,6 +708,28 @@ def validate_answer_set(
                             ans["reason"] = recovered.get("reason", "Sanitized numeric answer for county to verified geographic county")
                             ans["status"] = "ANSWERED"
 
+                # Sanitization: Positive/problem-free instructions contradict answering "Yes" to discrimination/incident questions
+                if run_context and run_context.user_instructions:
+                    user_inst_lower = run_context.user_instructions.lower()
+                    positive_instruct = any(k in user_inst_lower for k in [
+                        "every answer must be positive", "positive", "do not face any problem",
+                        "not face any problem", "no problem", "everywhere is safe", "safe everywhere",
+                        "never face problem", "never experienced"
+                    ])
+                    if positive_instruct:
+                        lbl_lower_field = (f.get("label") or "").lower()
+                        is_incident_q = any(k in lbl_lower_field for k in [
+                            "personally experienced a specific incident", "experienced a specific incident",
+                            "treated differently, unfairly, or targeted", "experienced discrimination",
+                            "victim of", "faced any problem", "experienced prejudice", "experienced hate"
+                        ])
+                        if is_incident_q:
+                            opts = f.get("options", [])
+                            no_opt = next((opt for opt in opts if opt.lower().strip() in ["no", "never", "none", "false"]), "No")
+                            ans["value"] = no_opt
+                            ans["reason"] = "Sanitized to 'No' per mandatory user instruction to keep answers positive and problem-free."
+                            ans["status"] = "ANSWERED"
+
         # 2b. Answer-Type-Aware Normalization & Candidate Resolution
         user_inst = run_context.user_instructions if run_context else ""
         conf_prof = run_context.confirmed_profile if run_context else None
