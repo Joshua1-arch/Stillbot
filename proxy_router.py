@@ -34,8 +34,9 @@ PROXY_POOLS = {
     # 50 Florida Residential Ports (10000-10049)
     "florida": _fmt_pool("PROXY_FLORIDA_AUTH", range(10000, 10050)),
     
-    # 50 Illinois Residential Ports (10000-10049)
-    "illinois": _fmt_pool("PROXY_ILLINOIS_AUTH", range(10000, 10050)),
+    # 100 Illinois / Chicago Residential Ports (10000-10099)
+    "illinois": _fmt_pool("PROXY_ILLINOIS_AUTH", range(10000, 10100)),
+    "chicago": _fmt_pool("PROXY_CHICAGO_AUTH", range(10000, 10100)),
     
     # 10 California Residential Ports (10000-10009)
     "california": _fmt_pool("PROXY_CALIFORNIA_AUTH", range(10000, 10010)),

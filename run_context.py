@@ -695,12 +695,17 @@ class RunContext(BaseModel):
                 "28540": "Onslow", "28546": "Onslow", "28541": "Onslow",
                 "27401": "Guilford", "27402": "Guilford", "27403": "Guilford",
                 "27601": "Wake", "27602": "Wake", "27603": "Wake",
-                "28202": "Mecklenburg", "28203": "Mecklenburg", "28204": "Mecklenburg"
+                "28202": "Mecklenburg", "28203": "Mecklenburg", "28204": "Mecklenburg",
+                "60601": "Cook", "60602": "Cook", "60608": "Cook", "60611": "Cook",
+                "60614": "Cook", "60616": "Cook"
             }
             if zip_val and str(zip_val).strip() in nc_zip_map:
                 c_name = nc_zip_map[str(zip_val).strip()]
                 self.token_metrics["deterministic_hits"] += 1
                 return c_name, "geographic_mapping"
+            if zip_val and str(zip_val).strip().startswith("606"):
+                self.token_metrics["deterministic_hits"] += 1
+                return "Cook", "geographic_mapping"
 
         # 13. City / Town
         if any(k in lbl_lower for k in ["city or town", "city / town", "what city", "your city", "town"]):

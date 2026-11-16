@@ -153,9 +153,17 @@ def lookup_county_for_location(city: Optional[str] = None, postal: Optional[str]
             return "New Hanover"
         elif clean_zip.startswith("288"):
             return "Buncombe"
+        elif clean_zip.startswith("606") or clean_zip.startswith("607") or clean_zip.startswith("608"):
+            return "Cook"
 
     if city:
         c_clean = str(city).strip().lower()
+        if c_clean in ["chicago"]:
+            return "Cook"
+        elif c_clean in ["aurora"]:
+            return "Kane"
+        elif c_clean in ["naperville"]:
+            return "DuPage"
         if c_clean in NC_CITY_TO_COUNTY:
             return NC_CITY_TO_COUNTY[c_clean]
         for c_key, cty in NC_CITY_TO_COUNTY.items():
